@@ -28,7 +28,8 @@ MITHYA addresses the core challenges of crypto-investigations:
 | **Behavioral ML** | 18 engineered features (e.g., Peel Chain Disparity, Fan-In/Out) fed into an Isolation Forest model. |
 | **Institutional Whitelist** | Pre-clears known safe addresses via `institutional_whitelist.csv` to eliminate false positives. |
 | **Abstract Ingestion Adapter** | Implements the Adapter pattern (`BaseTransactionAdapter`) ensuring cross-chain compatibility. |
-| **Interactive UI** | PyVis-powered network graph with Threat-Centric toggle and XAI tooltips. |
+| **Advanced 4-Tab UI** | Streamlit dashboard with Overview, Entity Attribution, PyVis Graph, and Advanced Heuristics Inspector. |
+| **Court-Ready Exports** | One-click export of a full forensic summary report detailing ML alerts and heuristic reasoning. |
 
 ---
 
@@ -43,8 +44,8 @@ MITHYA addresses the core challenges of crypto-investigations:
 │ .py                 │       │                      │       │                       │
 │ • BitcoinCSVAdapter │       │ • Mixer bypass       │       │ • Pyvis network graph │
 │ • Schema validation │       │ • Change-addr detect │       │ • Metric cards        │
-│                     │       │ • Wallet clustering  │       │ • XAI data table      │
-│                     │       │ • IsolationForest    │       │ • Threat toggle       │
+│                     │       │ • Wallet clustering  │       │ • Heuristics Inspector│
+│                     │       │ • IsolationForest    │       │ • Data regenerator    │
 │                     │       │ • Whitelist filter   │       │                       │
 │          ▲          │       │          ▼           │       │                       │
 └──────────┼──────────┘       └──────────┼───────────┘       └───────────────────────┘
@@ -54,7 +55,7 @@ MITHYA addresses the core challenges of crypto-investigations:
 
 **Data Flow:**
 1. `transaction_adapter.py` ingests `bitcoin_traffic.csv` via the `BitcoinCSVAdapter` and normalizes the pipe-delimited addresses.
-2. `ml_engine.py` builds a NetworkX graph, filters out mixers, detects change addresses and links them back to sender entities, clusters wallets via Union-Find, engineers 18 features, trains an `IsolationForest`, flags anomalies, applies the `institutional_whitelist.csv`, and optionally outputs `flagged_transactions.csv`.
+2. `ml_engine.py` builds a NetworkX graph, filters out mixers, detects change addresses and links them back to sender entities, clusters wallets via Union-Find, engineers 18 features, trains an `IsolationForest`, flags anomalies, applies the `institutional_whitelist.csv`, and returns a 3-tuple `(enriched_df, model, features_df)`.
 3. `app.py` runs a Streamlit dashboard that allows CSV upload, invokes the ML pipeline via the polymorphic adapter, and visualizes the results.
 
 ---
@@ -69,8 +70,8 @@ MITHYA addresses the core challenges of crypto-investigations:
 | **NetworkX** | Graph Clustering | Essential for the Union-Find algorithm underpinning wallet ownership grouping. |
 | **Streamlit** | Dashboard UI | Enables rapid frontend development strictly in Python. |
 | **PyVis** | Visualization | Renders physics-based (`forceAtlas2Based`) interactive graphs in-browser. |
-| **Faker / Requests**| Data Generation | Used exclusively in `data_generator.py` to synthesize realistic P2P traffic. |
-| **GeoIP2** | Legacy Telemetry | Depreciated in ML features, but still imported in `data_generator.py` for display metadata. |
+| **Faker / Requests**| Data Generation | Used exclusively in `generate_data.py` to synthesize realistic P2P traffic. |
+| **GeoIP2** | Legacy Telemetry | Depreciated in ML features, but still imported in `generate_data.py` for display metadata. |
 
 ---
 
@@ -143,19 +144,27 @@ The `generate_explanation()` function constructs human-readable reasons by evalu
 
 ## 8. Dashboard & Visualization Guide
 
-The Streamlit interface (`app.py`) provides the following components:
+The Streamlit interface (`app.py`) provides a robust 4-tab intelligence architecture:
 
-*   **File Uploader:** Sidebar widget accepting `.csv` files.
-*   **🎚️ Anomaly Sensitivity Slider:** Adjusts the IsolationForest contamination rate. (Range: 1%–20%, Default: 5%).
-*   **Bento Metric Cards:** Displays Total Scanned Transactions, Flagged Threats, and Max Risk Score.
-*   **🔍 Threat-Centric Mode Toggle:** Switch to view only flagged threats and immediate neighbors (Default: `True`).
-*   **PyVis Network Graph:** Renders nodes with `forceAtlas2Based` physics (Gravity: -120).
-    *   🔴 Suspicious IPs
-    *   🔵 Normal IPs
-    *   🟡 Flagged Transactions (Diamond)
-    *   ⚫ Normal Transactions (Diamond)
-    *   🟣 Entity Clusters (Square)
-*   **Investigation Panel:** Sortable DataFrame displaying the flagged transactions, risk scores, and XAI explanations.
+*   **Dynamic Sidebar:**
+    *   File uploaders for `.csv` and custom whitelists.
+    *   🎚️ Anomaly Sensitivity Slider: Adjusts the IsolationForest contamination rate.
+    *   ⚡ Synthetic Data Generator: Live re-generation of data with custom parameters (`total-records`, `suspicious-ratio`).
+    *   🏛️ Active Institutional Whitelist viewer.
+*   **Tab 1 - 🎯 Overview & Triage:**
+    *   6 Bento Metric Cards displaying Volume, Flagged Threats, Mixers, Peel Chains, etc.
+    *   Threat Vector Distribution Pie Chart and Risk Score Histogram.
+    *   📥 Court-Ready Report Export.
+*   **Tab 2 - 📋 Entity Attribution Viewer:**
+    *   Sortable and filterable DataFrame displaying flagged transactions.
+    *   Color-coded badges for Risk, Attack Types, and Ports.
+*   **Tab 3 - 🕸️ Graph & Clusters:**
+    *   PyVis Network Graph with `forceAtlas2Based` physics.
+    *   🔍 Threat-Centric Mode Toggle: View only flagged threats or broader network activity.
+    *   Color-coded nodes: 🔴 Suspicious, 🔵 Normal, 🟢 Regulated, 🟣 Entity Clusters.
+*   **Tab 4 - 🔬 Heuristics Inspector:**
+    *   Interactive drill-down panel for selected transactions.
+    *   Displays exactly which of the 18 mathematical heuristics triggered for the chosen entity.
 
 ---
 
@@ -163,11 +172,11 @@ The Streamlit interface (`app.py`) provides the following components:
 
 ```text
 SIH-2026-2/
-├── data_generator.py           # Generates synthetic P2P traffic dataset
+├── generate_data.py            # Generates synthetic P2P traffic dataset (CLI arguments supported)
 ├── ml_engine.py                # Core ML pipeline, graph logic, and XAI generator
 ├── transaction_adapter.py      # BaseTransactionAdapter and BitcoinCSVAdapter
-├── app.py                      # Streamlit frontend UI and PyVis rendering
-├── bitcoin_traffic.csv         # Raw 2,000-row synthetic dataset
+├── app.py                      # Streamlit 4-tab frontend UI and PyVis rendering
+├── bitcoin_traffic.csv         # Raw synthetic dataset
 ├── institutional_whitelist.csv # Offline CSV mapped to safe entity addresses
 ├── requirements.txt            # Python pip dependencies
 └── README.md                   # This documentation file
@@ -186,10 +195,11 @@ SIH-2026-2/
    pip install -r requirements.txt
    ```
 
-2. **Generate Data (Optional):**
+2. **Generate Synthetic Data:**
    ```bash
-   python data_generator.py
+   python generate_data.py --total-records 2000 --suspicious-ratio 0.25
    ```
+   *(By default, generates 1,500 records with a 20% suspicious ratio including CoinJoins, Peel Chains, Fan-Outs, and Fee Spikes.)*
 
 3. **Run the Dashboard:**
    ```bash
@@ -216,6 +226,7 @@ SIH-2026-2/
 | Change-address detection | `detect_change_address()` 5-factor heuristic | ✅ Completed |
 | Explainable alerts | `generate_explanation()` logic | ✅ Completed |
 | Interactive UI | `app.py` Streamlit + PyVis | ✅ Completed |
+| Actionable Intelligence | Advanced Heuristics Inspector & Exports | ✅ Completed |
 
 ---
 
