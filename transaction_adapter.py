@@ -140,7 +140,7 @@ class BaseTransactionAdapter(ABC):
         source: str | pd.DataFrame,
         contamination: float = 0.05,
         output_csv: Optional[str] = None,
-    ) -> Tuple[pd.DataFrame, IsolationForest]:
+    ) -> Tuple[pd.DataFrame, IsolationForest, pd.DataFrame]:
         """
         Full detection pipeline: load → normalise → features →
         train → score → explain → whitelist → (optional) export.
@@ -186,13 +186,13 @@ class BaseTransactionAdapter(ABC):
         if output_csv:
             ml_engine.export_results(enriched_df, output_csv)
 
-        return enriched_df, model
+        return enriched_df, model, features
 
     def run_pipeline_from_df(
         self,
         df: pd.DataFrame,
         contamination: float = 0.05,
-    ) -> Tuple[pd.DataFrame, IsolationForest]:
+    ) -> Tuple[pd.DataFrame, IsolationForest, pd.DataFrame]:
         """Convenience wrapper when the source is already a DataFrame."""
         return self.run_pipeline(df, contamination=contamination)
 

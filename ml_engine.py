@@ -1019,7 +1019,7 @@ def run_pipeline(
     output_csv: str = OUTPUT_CSV,
     contamination: float = CONTAMINATION,
     adapter=None,
-) -> Tuple[pd.DataFrame, IsolationForest]:
+) -> Tuple[pd.DataFrame, IsolationForest, pd.DataFrame]:
     """
     Full detection pipeline.
 
@@ -1066,15 +1066,24 @@ def run_pipeline(
     _log(f"{'─' * 60}")
     _log(f"  [✓] Pipeline complete.\n")
 
-    return enriched_df, model
+    return enriched_df, model, features
 
 def run_pipeline_from_df(
     df: pd.DataFrame,
     contamination: float = CONTAMINATION,
     adapter=None,
-) -> Tuple[pd.DataFrame, IsolationForest]:
+) -> Tuple[pd.DataFrame, IsolationForest, pd.DataFrame]:
     """
     Run the pipeline on an already-loaded DataFrame.
+
+    Returns
+    -------
+    enriched_df : pd.DataFrame
+        Transaction DataFrame with risk scores, anomaly flags, and explanations.
+    model : IsolationForest
+        The trained model instance.
+    features : pd.DataFrame
+        The numeric feature matrix used for scoring (for the Heuristics Inspector).
 
     Parameters
     ----------
@@ -1097,7 +1106,7 @@ def run_pipeline_from_df(
     # ── Institutional Whitelist Override ──
     enriched_df = apply_institutional_whitelist(enriched_df)
 
-    return enriched_df, model
+    return enriched_df, model, features
 
 
 # ═══════════════════════════════════════════════════════════════════════════

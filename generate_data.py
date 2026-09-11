@@ -3,14 +3,20 @@ generate_data.py — Synthetic Crypto-Forensic Data Generator
 ===========================================================
 
 Generates realistic Bitcoin transaction datasets for the MITHYA triage engine.
-Simulates distinct threat vectors (CoinJoins, Peel Chains) and high-volume
-institutional traffic to test anomaly detection and whitelisting.
+Simulates distinct threat vectors (CoinJoins, Peel Chains, Fan-Out Dispersals,
+Fee Spikes) and high-volume institutional traffic to test anomaly detection
+and whitelisting.
+
+Usage:
+  python generate_data.py                                      # defaults
+  python generate_data.py --total-records 2000 --suspicious-ratio 0.30
 
 Outputs:
   - bitcoin_traffic.csv (Transaction graph data)
   - institutional_whitelist.csv (Pre-cleared entities)
 """
 
+import argparse
 import hashlib
 import random
 import string
@@ -309,8 +315,11 @@ def create_fee_spike() -> dict:
 # ---------------------------------------------------------------------------
 # Pipeline Execution
 # ---------------------------------------------------------------------------
-def main():
-    print(f"[*] Initializing Synthetic Data Generator (Records: {TOTAL_RECORDS})")
+def main(total_records: int = TOTAL_RECORDS, suspicious_ratio: float = SUSPICIOUS_RATIO):
+    num_suspicious = int(total_records * suspicious_ratio)
+    num_normal = total_records - num_suspicious
+
+    print(f"[*] Initializing Synthetic Data Generator (Records: {total_records})")
     
     # 1. Generate Whitelist
     generate_whitelist_csv()
@@ -319,7 +328,7 @@ def main():
     transactions = []
     
     # Generate Suspicious — distribute across all 4 threat vectors
-    for _ in range(NUM_SUSPICIOUS):
+    for _ in range(num_suspicious):
         roll = random.random()
         if roll < 0.25:
             transactions.append(create_coinjoin_mixer())
@@ -331,7 +340,7 @@ def main():
             transactions.append(create_fee_spike())
             
     # Generate Normal (Standard and Institutional)
-    for _ in range(NUM_NORMAL):
+    for _ in range(num_normal):
         if random.random() < 0.15:
             transactions.append(create_institutional_transfer())
         else:
@@ -346,7 +355,7 @@ def main():
     df.to_csv(OUTPUT_CSV, index=False)
     
     print(f"[*] Generated {len(df)} transactions -> Saved to '{OUTPUT_CSV}'.")
-    print(f"[*] Threat Vectors injected: {NUM_SUSPICIOUS} ({SUSPICIOUS_RATIO*100:.1f}%)")
+    print(f"[*] Threat Vectors injected: {num_suspicious} ({suspicious_ratio*100:.1f}%)")
     
     breakdown = df["attack_type"].value_counts()
     print("\n--- Breakdown ---")
@@ -355,4 +364,10 @@ def main():
     print("-----------------\n[✓] Done.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="MITHYA Synthetic Data Generator")
+    parser.add_argument("--total-records", type=int, default=TOTAL_RECORDS,
+                        help=f"Total number of transactions to generate (default: {TOTAL_RECORDS})")
+    parser.add_argument("--suspicious-ratio", type=float, default=SUSPICIOUS_RATIO,
+                        help=f"Fraction of suspicious transactions (default: {SUSPICIOUS_RATIO})")
+    args = parser.parse_args()
+    main(total_records=args.total_records, suspicious_ratio=args.suspicious_ratio)
