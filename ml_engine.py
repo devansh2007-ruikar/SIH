@@ -26,6 +26,31 @@ from sklearn.ensemble import IsolationForest
 # pyrefly: ignore [missing-import]
 from sklearn.preprocessing import MinMaxScaler
 
+# ── Peel-chain feature extraction (delegated to features module) ────────
+from features import (
+    compute_peel_pattern_disparity,
+    detect_multihop_peel_chains,
+    parse_pipe_amounts as _parse_pipe_amounts_impl,
+    parse_pipe_addresses as _parse_pipe_addresses_impl,
+    count_pipe_elements as _count_pipe_elements_impl,
+)
+
+# ── Anomaly scoring (delegated to anomaly_engine module) ────────────────
+from anomaly_engine import (
+    compute_anomaly_deviation_scores,
+    compute_investigative_priority,
+)
+
+# ── Percentile-based explainability (delegated to explainability module) ─
+from explainability import (
+    build_dataset_profile as _build_dataset_profile,
+    generate_explanation as _generate_explanation_percentile,
+    generate_all_explanations as _generate_all_explanations_percentile,
+)
+
+# Backward-compatible alias — app.py imports this name from ml_engine
+compute_peel_chain_disparity = compute_peel_pattern_disparity
+
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import builtins as _builtins
@@ -40,7 +65,7 @@ def _log(msg: str) -> None:
 
 INPUT_CSV = "bitcoin_traffic.csv"
 OUTPUT_CSV = "flagged_transactions.csv"
-WHITELIST_CSV = "institutional_whitelist.csv"
+WHITELIST_CSV = os.path.join("sample_data", "institutional_whitelist.csv")
 CONTAMINATION = 0.05
 
 MICRO_TX_THRESHOLD = 0.006
@@ -49,16 +74,16 @@ MICRO_TX_THRESHOLD = 0.006
 # Standard Bitcoin P2P ports (mainnet + testnet) → baseline risk = 0.0
 STANDARD_P2P_PORTS = {8332, 8333, 8334, 18332, 18333, 18444, 38332, 38333}
 
-# Ports commonly associated with proxies, SOCKS, or Tor hidden services
-KNOWN_PROXY_TOR_PORTS = {
-    9050, 9051, 9150,          # Tor SOCKS / control
-    1080,                       # SOCKS5
-    3128, 8080, 8888,          # HTTP proxies
-    443,                        # TLS — often used for Tor bridges / tunneling
+# Confirmed anonymisation / proxy software ports — high forensic signal
+# Only ports with unambiguous criminal-tooling association belong here.
+ANON_PROXY_PORTS = {
+    9050, 9051, 9150,          # Tor SOCKS / Tor control
+    4444,                       # I2P HTTP proxy
 }
 
-# Ports above this threshold are treated as ephemeral / suspicious
-EPHEMERAL_PORT_FLOOR = 49152
+# Zero-risk ports: standard Bitcoin P2P + common legitimate services
+# Port 443 (HTTPS) and 80 (HTTP) are ubiquitous and must NOT be penalised.
+ZERO_RISK_PORTS = STANDARD_P2P_PORTS | {443, 80}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. DATA LOADING
@@ -243,13 +268,11 @@ def _is_round_amount(value: float, max_decimals: int = 3) -> bool:
 
 
 def _parse_pipe_addresses(raw) -> List[str]:
-    """Safely split a pipe-delimited address string into a list."""
-    if raw is None:
-        return []
-    text = str(raw).strip()
-    if text in ("", "nan", "None"):
-        return []
-    return [a.strip() for a in text.split("|") if a.strip()]
+    """Safely split a pipe-delimited address string into a list.
+
+    Delegates to :func:`features.parse_pipe_addresses`.
+    """
+    return _parse_pipe_addresses_impl(raw)
 
 
 def detect_change_address(
@@ -423,12 +446,14 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
         total_rows += 1
         inputs = str(row["input_addresses"]).split("|")
         inputs = [a.strip() for a in inputs if a.strip()]
+        outputs = _parse_pipe_addresses(row.get("output_addresses"))
 
-        # Track all addresses we've ever seen (for novelty heuristic)
-        for addr in inputs:
-            known_addresses.add(addr)
-        for addr in _parse_pipe_addresses(row.get("output_addresses")):
-            known_addresses.add(addr)
+        # ── CRITICAL: snapshot known_addresses BEFORE this tx ────────
+        # The novelty heuristic in detect_change_address() must see
+        # only addresses from *prior* transactions — not the current
+        # transaction's own outputs.  Adding them first invalidated
+        # Heuristic 4 (Novel Address Bias) entirely.
+        historical_addresses = known_addresses.copy()
 
         # ── Mixer bypass check ──────────────────────────────────────
         if is_mixer_transaction(row):
@@ -438,6 +463,9 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
             for addr in inputs:
                 address_graph.add_node(addr)
             mixer_bypassed += 1
+            # Update known_addresses AFTER analysis (even for mixers)
+            known_addresses.update(inputs)
+            known_addresses.update(outputs)
             continue
         # ─────────────────────────────────────────────────────────────
 
@@ -451,15 +479,20 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
         # Identify the change output and link it to the sender's
         # entity cluster (first input address).  This prevents the
         # change address from being treated as a separate wallet.
+        # Uses the HISTORICAL snapshot so the novelty check is valid.
         if inputs:
             change_addr = detect_change_address(
-                row, known_addresses=known_addresses,
+                row, known_addresses=historical_addresses,
             )
             if change_addr is not None:
                 address_graph.add_node(change_addr)
                 address_graph.add_edge(inputs[0], change_addr)
                 change_detected += 1
         # ─────────────────────────────────────────────────────────────
+
+        # Update known_addresses AFTER all analysis for this tx
+        known_addresses.update(inputs)
+        known_addresses.update(outputs)
 
     _log(
         f"[*] Mixer bypass: {mixer_bypassed}/{total_rows} transactions "
@@ -489,32 +522,71 @@ def _frequency_encode(series: pd.Series) -> pd.Series:
 # 2c. PORT-RISK SCORING
 # ═══════════════════════════════════════════════════════════════════════════
 
-def score_port_risk(port) -> float:
+def _compute_port_frequency(df: pd.DataFrame) -> Dict[int, float]:
+    """
+    Compute the relative frequency of each port across the dataset.
+
+    Combines ``src_port`` and ``dst_port`` into a single frequency
+    distribution.  Used to derive a *rarity index* — ports seen
+    rarely across the dataset are more suspicious than common ones.
+
+    Returns
+    -------
+    dict[int, float]
+        Mapping ``{port: relative_frequency}`` where frequencies
+        sum to 1.0.
+    """
+    all_ports = pd.concat(
+        [df["src_port"], df["dst_port"]], ignore_index=True,
+    ).dropna()
+    all_ports = pd.to_numeric(all_ports, errors="coerce").dropna().astype(int)
+    freq = all_ports.value_counts(normalize=True)
+    return freq.to_dict()
+
+
+def score_port_risk(port, port_freq: Dict[int, float] | None = None) -> float:
     """
     Return a risk score in [0.0, 1.0] for a network port.
 
-    Tiers
-    -----
-    * **0.0** — Standard Bitcoin P2P port (8332, 8333, …)
-    * **0.3** — Any other well-known / registered port (< 49152)
-    * **0.6** — Ephemeral / high-range port (>= 49152), commonly
-      used by NAT, proxies, or automated tools
-    * **1.0** — Known proxy / Tor / tunneling port (9050, 1080, …)
+    Scoring Strategy
+    ----------------
+    * **0.0** — Zero-risk: standard Bitcoin P2P ports (8333 etc.),
+      HTTPS (443), and HTTP (80).
+    * **1.0** — Confirmed anonymisation/proxy: Tor SOCKS (9050, 9051,
+      9150) and I2P (4444).
+    * **Rarity index** — All other ports are scored based on their
+      frequency in the dataset.  Rare ports → higher risk, common
+      ports → lower risk.  Formula: ``1 - freq`` capped at [0, 0.8].
 
-    Returns 0.5 (neutral) for unparseable or missing values.
+    Parameters
+    ----------
+    port : int-like
+        The port number to score.
+    port_freq : dict[int, float] | None
+        Pre-computed port frequency distribution from
+        :func:`_compute_port_frequency`.  When ``None``, falls back
+        to a neutral 0.1 for non-special ports (backward compatible).
+
+    Returns 0.1 (low-neutral) for unparseable or missing values.
     """
     try:
         p = int(port)
     except (ValueError, TypeError):
-        return 0.5               # missing / corrupt → neutral
+        return 0.1               # missing / corrupt → low-neutral
 
-    if p in STANDARD_P2P_PORTS:
+    if p in ZERO_RISK_PORTS:
         return 0.0               # baseline — expected traffic
-    if p in KNOWN_PROXY_TOR_PORTS:
-        return 1.0               # highest penalty
-    if p >= EPHEMERAL_PORT_FLOOR:
-        return 0.6               # ephemeral range — moderate risk
-    return 0.3                    # other well-known port — low risk
+    if p in ANON_PROXY_PORTS:
+        return 1.0               # confirmed anonymisation tooling
+
+    # Rarity-based scoring for all other ports
+    if port_freq is not None:
+        freq = port_freq.get(p, 0.0)
+        # Invert: rare ports (low freq) → high risk
+        # Cap at 0.8 to keep Tor/I2P at the top of the scale
+        return round(min(1.0 - freq, 0.8), 4)
+
+    return 0.1                    # fallback when no frequency data
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -522,74 +594,34 @@ def score_port_risk(port) -> float:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _parse_pipe_amounts(raw) -> List[float]:
-    """Safely split a pipe-delimited string into a list of floats."""
-    if raw is None:
-        return []
-    text = str(raw).strip()
-    if text in ("", "nan", "None"):
-        return []
-    result = []
-    for token in text.split("|"):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            result.append(float(token))
-        except (ValueError, TypeError):
-            continue
-    return result
+    """Safely split a pipe-delimited string into a list of floats.
+
+    Delegates to :func:`features.parse_pipe_amounts`.
+    """
+    return _parse_pipe_amounts_impl(raw)
 
 
 def _count_pipe_elements(raw) -> int:
-    """Count non-empty elements in a pipe-delimited string."""
-    if raw is None:
-        return 0
-    text = str(raw).strip()
-    if text in ("", "nan", "None"):
-        return 0
-    return len([t for t in text.split("|") if t.strip()])
+    """Count non-empty elements in a pipe-delimited string.
+
+    Delegates to :func:`features.count_pipe_elements`.
+    """
+    return _count_pipe_elements_impl(raw)
 
 
 def compute_peel_chain_disparity(output_amounts_str) -> float:
     """
-    Detect peel-chain laundering structure.
+    Detect peel-chain laundering structure (single-split candidate).
 
-    In a peel chain the sender peels off a small payment to the
-    recipient and sends the bulk back to a change address.  This
-    produces a characteristic **two-output** pattern where one
-    output is a micro-fraction (< 1 %) and the other captures the
-    remaining balance (> 99 %).
+    .. deprecated::
+        Use :func:`features.compute_peel_pattern_disparity` directly.
+        This wrapper is kept for backward compatibility with consumers
+        that import ``compute_peel_chain_disparity`` from ``ml_engine``.
 
-    Returns
-    -------
-    float
-        A disparity score in ``[0.0, 1.0]``:
-        * **1.0** — perfect peel-chain signature (one output < 1 %,
-          the other > 99 % of total output value)
-        * **0.0** — no peel pattern detected (single output, equal
-          split, or more than two outputs)
-
-    The score for two outputs is ``max_share - min_share``, yielding
-    values near 1.0 for extreme disparity and near 0.0 for even
-    splits.  Transactions with != 2 outputs return 0.0 because
-    the peel-chain heuristic is defined only for the two-output case.
+    Delegates to :func:`features.compute_peel_pattern_disparity`.
     """
-    amounts = _parse_pipe_amounts(output_amounts_str)
-    if len(amounts) != 2:
-        return 0.0                # heuristic applies to 2-output txs only
+    return compute_peel_pattern_disparity(output_amounts_str)
 
-    total = sum(amounts)
-    if total <= 0:
-        return 0.0
-
-    shares = [a / total for a in amounts]
-    max_share = max(shares)
-    min_share = min(shares)
-
-    # Classic peel: one side < 1 %, other > 99 %
-    if min_share < 0.01 and max_share > 0.99:
-        return round(max_share - min_share, 6)
-    return 0.0
 
 
 def compute_fan_in_out(row) -> Tuple[int, int, float]:
@@ -638,6 +670,19 @@ def compute_fee_rate_urgency(row) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 3a-ii. MULTI-HOP PEEL CHAIN DETECTION
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The canonical implementation now lives in features.py and uses a
+# NetworkX DiGraph for directed graph traversal.  The function is
+# imported at the top of this module:
+#
+#     from features import detect_multihop_peel_chains
+#
+# The import is used directly in engineer_features() below.
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 3b. FEATURE ENGINEERING
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -645,7 +690,7 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Transform raw transaction data into graph-aware numeric features.
     """
-    _, entity_map = build_entity_graph(df)
+    address_graph, entity_map = build_entity_graph(df)
     
     # Assign Entity ID to each transaction (based on first input)
     entities = []
@@ -695,18 +740,23 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if "script_type" in df.columns:
         features["script_type_freq"] = _frequency_encode(df["script_type"])
 
-    # --- Port-Risk Features (replaces binary src_port_is_std) ---
-    features["src_port_risk"] = df["src_port"].apply(score_port_risk)
-    features["dst_port_risk"] = df["dst_port"].apply(score_port_risk)
+    # --- Port-Risk Features (rarity-aware, replaces binary src_port_is_std) ---
+    port_freq = _compute_port_frequency(df)
+    features["src_port_risk"] = df["src_port"].apply(
+        lambda p: score_port_risk(p, port_freq)
+    )
+    features["dst_port_risk"] = df["dst_port"].apply(
+        lambda p: score_port_risk(p, port_freq)
+    )
     features["port_risk_combined"] = (
         features["src_port_risk"] * 0.6 + features["dst_port_risk"] * 0.4
     ).round(4)
 
     # --- Behavioral Crime-Detection Features ---
 
-    # 1) Peel Chain Disparity
+    # 1) Peel-Pattern Candidate Disparity (renamed from peel_chain_disparity)
     features["peel_chain_disparity"] = df["output_amounts"].apply(
-        compute_peel_chain_disparity
+        compute_peel_pattern_disparity
     )
 
     # 2) Fan-In / Fan-Out Ratios
@@ -731,6 +781,13 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     # Take absolute Z-score — both extremes are suspicious
     features["value_zscore_abs"] = features["value_zscore"].abs()
+
+    # --- Multi-Hop Peel Chain Detection (NetworkX DiGraph) ---
+    chain_data = detect_multihop_peel_chains(df)
+    features["peel_chain_length"] = chain_data["chain_length"]
+    features["peel_chain_hop_position"] = chain_data["hop_position"]
+    features["fund_diminishment_ratio"] = chain_data["fund_diminishment_ratio"]
+    df["peel_chain_id"] = chain_data["chain_id"]
 
     _log(f"[*] Engineered {features.shape[1]} features: {list(features.columns)}")
     return features, df
@@ -757,92 +814,92 @@ def train_model(features: pd.DataFrame, contamination: float = CONTAMINATION) ->
     return model, predictions, raw_scores
 
 def compute_risk_scores(raw_scores: np.ndarray) -> np.ndarray:
-    inverted = -raw_scores
-    min_score = inverted.min()
-    max_score = inverted.max()
-    
-    if max_score > min_score:
-        scaled = (inverted - min_score) / (max_score - min_score)
-        risk_pct = scaled * 100.0
-    else:
-        risk_pct = np.zeros_like(inverted)
-        
-    return np.clip(risk_pct, 0, 100).round(1)
+    """
+    Compute Anomaly Deviation Scores (0–100).
+
+    .. deprecated::
+        Use :func:`anomaly_engine.compute_anomaly_deviation_scores`
+        directly.  This wrapper is kept for backward compatibility.
+
+    This score represents **unsupervised statistical distance** from
+    the learned transaction distribution via IsolationForest.  It is
+    NOT a calibrated probability of guilt, criminal activity, or
+    confidence.  It should be interpreted as: "How far does this
+    transaction deviate from the baseline behavior learned by the
+    model?"
+
+    Parameters
+    ----------
+    raw_scores : np.ndarray
+        Raw output from ``IsolationForest.decision_function()``.
+
+    Returns
+    -------
+    np.ndarray
+        Anomaly Deviation Scores in [0.0, 100.0].
+    """
+    return compute_anomaly_deviation_scores(raw_scores)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. EXPLAINABLE AI (XAI)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def generate_explanation(row_features: pd.Series, risk_score: float, original_row: pd.Series) -> str:
+def generate_explanation(row_features, risk_score, original_row, dataset_profile=None):
+    """
+    Generate a human-readable explanation for a flagged transaction.
+
+    .. deprecated::
+        Use :func:`explainability.generate_explanation` directly for
+        percentile-based explanations.
+
+    When *dataset_profile* is provided, delegates to the new
+    percentile-based explainability module.  Otherwise falls back
+    to a minimal explanation.
+    """
+    if dataset_profile is not None:
+        return _generate_explanation_percentile(
+            row_features, risk_score, original_row, dataset_profile,
+        )
+    # Fallback when no profile is available
     if risk_score < 50.0:
         return "Normal network traffic behavior."
+    return (
+        "Anomalous deviation from baseline transaction distribution "
+        "(structural graph relationships flagged by unsupervised model)."
+    )
 
-    reasons = []
-    
-    if row_features["entity_ip_diversity"] > 2:
-        reasons.append(f"Entity uses multiple distinct IPs ({int(row_features['entity_ip_diversity'])} IPs), suggesting anonymization")
-        
-    if row_features["ip_entity_diversity"] > 2:
-        reasons.append(f"IP {original_row['src_ip']} broadcasts for multiple distinct entities, acting as a high-traffic node")
-        
-    if row_features["src_ip_freq"] > 0.05:
-        reasons.append("High-frequency IP broadcast pattern")
-        
-    if row_features["is_micro_tx"] == 1:
-        reasons.append(f"Micro-transaction detected ({original_row.get('total_amount_btc', 0):.4f} BTC)")
 
-    if row_features["port_risk_combined"] >= 0.6:
-        src_p = original_row.get('src_port', '?')
-        dst_p = original_row.get('dst_port', '?')
-        reasons.append(
-            f"Anomalous port profile (src:{src_p} / dst:{dst_p}) — "
-            f"possible proxy/Tor/tunneling"
+def generate_all_explanations(
+    df: pd.DataFrame,
+    features: pd.DataFrame,
+    predictions: np.ndarray,
+    risk_scores: np.ndarray,
+    dataset_profile=None,
+) -> pd.DataFrame:
+    """
+    Batch-generate explanations for all transactions.
+
+    When *dataset_profile* is provided (the new path), delegates to
+    :func:`explainability.generate_all_explanations` which produces
+    percentile-based audit reasons and structured telemetry.
+
+    Parameters
+    ----------
+    dataset_profile : DatasetProfile | None
+        Pre-computed dataset statistics.  Pass ``None`` to use the
+        legacy (hardcoded-threshold) fallback.
+    """
+    _log("[*] Generating percentile-aware risk explanations …")
+
+    if dataset_profile is not None:
+        return _generate_all_explanations_percentile(
+            df, features, predictions, risk_scores, dataset_profile,
         )
 
-    if row_features.get("peel_chain_disparity", 0) > 0:
-        reasons.append(
-            f"Peel-chain output structure detected "
-            f"(disparity={row_features['peel_chain_disparity']:.4f}) — "
-            f"classic layering signature"
-        )
-
-    fan_ratio = row_features.get("fan_ratio", 1.0)
-    fan_in  = int(row_features.get("fan_in", 0))
-    fan_out = int(row_features.get("fan_out", 0))
-    if fan_ratio > 5:
-        reasons.append(
-            f"Mass consolidation ({fan_in} inputs → {fan_out} outputs, "
-            f"ratio={fan_ratio:.1f})"
-        )
-    elif fan_ratio < 0.2 and fan_out > 5:
-        reasons.append(
-            f"Rapid dispersal ({fan_in} inputs → {fan_out} outputs, "
-            f"ratio={fan_ratio:.2f})"
-        )
-
-    if row_features.get("fee_rate_urgency", 0) > 0.05:
-        reasons.append(
-            f"Fee-rate urgency ({row_features['fee_rate_urgency']:.4f}) — "
-            f"miner-priority overpayment suggesting time-sensitive hop"
-        )
-
-    if row_features.get("value_zscore_abs", 0) > 2.5:
-        reasons.append(
-            f"Volume outlier (Z-score={row_features.get('value_zscore', 0):.2f}) — "
-            f"statistically anomalous transaction value"
-        )
-
-    if not reasons:
-        reasons.append("Anomalous structural graph relationships detected by ML")
-
-    return "Risk indicators: " + "; ".join(reasons) + "."
-
-def generate_all_explanations(df: pd.DataFrame, features: pd.DataFrame, predictions: np.ndarray, risk_scores: np.ndarray) -> pd.DataFrame:
-    _log("[*] Generating graph-aware risk explanations …")
+    # Legacy fallback (no profile)
     result = df.copy()
     result["is_anomaly"] = (predictions == -1)
     result["risk_score"] = risk_scores
-    
     explanations = []
     for idx, row in result.iterrows():
         if row["is_anomaly"]:
@@ -851,7 +908,6 @@ def generate_all_explanations(df: pd.DataFrame, features: pd.DataFrame, predicti
             explanations.append(exp)
         else:
             explanations.append("Normal.")
-            
     result["explanation"] = explanations
     return result
 
@@ -924,16 +980,28 @@ def apply_institutional_whitelist(
     whitelist_csv: str = WHITELIST_CSV,
 ) -> pd.DataFrame:
     """
-    Post-scoring filter: override risk for transactions involving
-    known institutional wallets.
+    Post-scoring filter: apply entity-level whitelist annotations.
 
-    For every row where **any** address in ``input_addresses`` or
-    ``output_addresses`` appears in the whitelist:
+    **Scoping**: Whitelisting is applied to individual entity *nodes*,
+    not entire transactions.  This prevents criminal deposit trails
+    (e.g., laundered funds sent *to* Binance) from being concealed.
 
-    * ``risk_score``  → **0.0**
-    * ``is_anomaly``  → **False**
-    * ``explanation`` → **"Regulated Entity (<institution>)"**
-    * ``entity_id``   → **"Regulated Entity"** (if column exists)
+    Behaviour
+    ---------
+    For each transaction, check input and output sides independently:
+
+    * **Both sides whitelisted** → full override:
+      ``risk_score → 0.0``, ``is_anomaly → False``.
+    * **One side whitelisted** → risk *discount* (×0.15) but anomaly
+      flag and scoring on the unverified counterparty are retained.
+      Explanation is updated to indicate which side is regulated.
+    * **Neither side whitelisted** → no change.
+
+    New columns added:
+
+    * ``whitelisted_side`` — ``"input"``, ``"output"``, ``"both"``,
+      or ``None``.
+    * ``whitelisted_entity`` — institution name(s) or ``None``.
 
     Parameters
     ----------
@@ -952,7 +1020,7 @@ def apply_institutional_whitelist(
     Returns
     -------
     pd.DataFrame
-        The same DataFrame with institutional rows overridden.
+        The same DataFrame with per-side whitelist annotations.
     """
     if whitelist is None:
         whitelist, labels = load_institutional_whitelist(whitelist_csv)
@@ -960,9 +1028,17 @@ def apply_institutional_whitelist(
         labels = {}
 
     if not whitelist:
-        return df                 # nothing to filter
+        # Ensure columns exist even when whitelist is empty
+        df["whitelisted_side"] = None
+        df["whitelisted_entity"] = None
+        return df
 
-    def _has_whitelisted_address(raw) -> Tuple[bool, str]:
+    # Risk discount factor when only one side is institutional.
+    # The regulated side lowers overall suspicion but does NOT
+    # eliminate scoring on the unverified counterparty.
+    _SINGLE_SIDE_DISCOUNT = 0.15
+
+    def _check_side(raw) -> Tuple[bool, str]:
         """Check if any pipe-delimited address is in the whitelist."""
         if raw is None:
             return False, ""
@@ -975,28 +1051,77 @@ def apply_institutional_whitelist(
                 return True, labels.get(addr_clean, "Unknown Institution")
         return False, ""
 
-    overridden = 0
+    both_cleared = 0
+    single_discounted = 0
+
+    # Pre-populate annotation columns
+    df["whitelisted_side"] = None
+    df["whitelisted_entity"] = None
 
     for idx in df.index:
-        matched, institution = _has_whitelisted_address(
+        input_match, input_inst = _check_side(
             df.at[idx, "input_addresses"]
         )
-        if not matched:
-            matched, institution = _has_whitelisted_address(
-                df.at[idx, "output_addresses"]
-            )
+        output_match, output_inst = _check_side(
+            df.at[idx, "output_addresses"]
+        )
 
-        if matched:
+        if input_match and output_match:
+            # ── Both sides are regulated → full override ─────────
+            institutions = ", ".join(
+                filter(None, dict.fromkeys([input_inst, output_inst]))
+            )
             df.at[idx, "risk_score"]  = 0.0
             df.at[idx, "is_anomaly"] = False
-            df.at[idx, "explanation"] = f"Regulated Entity ({institution})."
+            df.at[idx, "explanation"] = (
+                f"Regulated Entity ({institutions}) — both sides institutional."
+            )
             if "entity_id" in df.columns:
                 df.at[idx, "entity_id"] = "Regulated Entity"
-            overridden += 1
+            df.at[idx, "whitelisted_side"] = "both"
+            df.at[idx, "whitelisted_entity"] = institutions
+            both_cleared += 1
+
+        elif input_match:
+            # ── Only input side is regulated ──────────────────────
+            # Discount risk but DO NOT zero it — the output side
+            # (recipient) is unverified and could be criminal.
+            original_risk = float(df.at[idx, "risk_score"])
+            discounted = round(original_risk * _SINGLE_SIDE_DISCOUNT, 2)
+            df.at[idx, "risk_score"] = discounted
+            # Preserve is_anomaly — anomaly status reflects the
+            # unverified counterparty, not the regulated side.
+            existing_expl = str(df.at[idx, "explanation"])
+            df.at[idx, "explanation"] = (
+                f"Regulated Entity ({input_inst}) on input side; "
+                f"output counterparty unverified. {existing_expl}"
+            )
+            df.at[idx, "whitelisted_side"] = "input"
+            df.at[idx, "whitelisted_entity"] = input_inst
+            single_discounted += 1
+
+        elif output_match:
+            # ── Only output side is regulated ─────────────────────
+            # This is the critical case: a potentially criminal
+            # sender depositing to a regulated exchange.  Risk must
+            # NOT be zeroed — the sender is the suspect.
+            original_risk = float(df.at[idx, "risk_score"])
+            discounted = round(original_risk * _SINGLE_SIDE_DISCOUNT, 2)
+            df.at[idx, "risk_score"] = discounted
+            existing_expl = str(df.at[idx, "explanation"])
+            df.at[idx, "explanation"] = (
+                f"Regulated Entity ({output_inst}) on output side; "
+                f"input counterparty unverified. {existing_expl}"
+            )
+            df.at[idx, "whitelisted_side"] = "output"
+            df.at[idx, "whitelisted_entity"] = output_inst
+            single_discounted += 1
 
     _log(
-        f"[*] Institutional whitelist: {overridden}/{len(df)} transactions "
-        f"matched and cleared (risk → 0.0)."
+        f"[*] Institutional whitelist: {both_cleared}/{len(df)} transactions "
+        f"fully cleared (both sides institutional, risk → 0.0). "
+        f"{single_discounted}/{len(df)} transactions discounted "
+        f"(single-side match, risk × {_SINGLE_SIDE_DISCOUNT})."
     )
     return df
 
@@ -1042,8 +1167,10 @@ def run_pipeline(
     df = load_data(input_csv)
     features, df = engineer_features(df)
     model, predictions, raw_scores = train_model(features, contamination=contamination)
-    risk_scores = compute_risk_scores(raw_scores)
-    enriched_df = generate_all_explanations(df, features, predictions, risk_scores)
+    risk_scores = compute_anomaly_deviation_scores(raw_scores)
+    dataset_profile = _build_dataset_profile(features)
+    _log(f"[*] Built dataset profile: {len(dataset_profile.stats)} features profiled")
+    enriched_df = generate_all_explanations(df, features, predictions, risk_scores, dataset_profile)
 
     # ── Institutional Whitelist Override ──
     enriched_df = apply_institutional_whitelist(enriched_df)
@@ -1100,8 +1227,9 @@ def run_pipeline_from_df(
 
     features, df = engineer_features(df)
     model, predictions, raw_scores = train_model(features, contamination=contamination)
-    risk_scores = compute_risk_scores(raw_scores)
-    enriched_df = generate_all_explanations(df, features, predictions, risk_scores)
+    risk_scores = compute_anomaly_deviation_scores(raw_scores)
+    dataset_profile = _build_dataset_profile(features)
+    enriched_df = generate_all_explanations(df, features, predictions, risk_scores, dataset_profile)
 
     # ── Institutional Whitelist Override ──
     enriched_df = apply_institutional_whitelist(enriched_df)

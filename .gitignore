@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables
+.env
+.env.local
+
+# Pytest
+.pytest_cache/
+coverage.xml
+htmlcov/
+.coverage
+
+# Output / generated files
+flagged_transactions.csv
+*_report.txt
+*.log
+
+# IDEs
+.vscode/
+.idea/

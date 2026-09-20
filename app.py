@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 import os
+import json
+import socket
 from datetime import datetime
 from pathlib import Path
 from io import StringIO
@@ -31,6 +33,18 @@ import streamlit.components.v1 as components
 # pyrefly: ignore [missing-import]
 from pyvis.network import Network
 
+# ---------------------------------------------------------------------------
+# AIR-GAP SANITIZATION (Strict Offline Enforcement)
+# ---------------------------------------------------------------------------
+_original_socket = socket.socket
+class AirGapSocket(_original_socket):
+    def connect(self, address):
+        host = address[0] if isinstance(address, tuple) else address
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise PermissionError(f"Air-Gap Violation: Outbound connection to {host} blocked.")
+        return super().connect(address)
+socket.socket = AirGapSocket
+
 # Import the AI engine and cross-chain adapter layer
 from ml_engine import (
     run_pipeline_from_df,
@@ -42,8 +56,8 @@ from ml_engine import (
     _parse_pipe_amounts,
     _count_pipe_elements,
     load_institutional_whitelist,
+    get_adapter,
 )
-from transaction_adapter import BitcoinCSVAdapter
 
 # ---------------------------------------------------------------------------
 # Page configuration (must be first Streamlit call)
@@ -62,14 +76,10 @@ st.set_page_config(
 
 CUSTOM_CSS = """
 <style>
-    /* ── Import premium font ───────────────────────────────────── */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
-
     /* ── Global dark theme overrides ───────────────────────────── */
     .stApp {
         background: linear-gradient(145deg, #0a0a0f 0%, #0d1117 40%, #0f0b1a 100%);
-        font-family: 'Inter', sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
 
     /* Hide default Streamlit header/footer */
@@ -81,7 +91,7 @@ CUSTOM_CSS = """
         padding: 1.5rem 0 0.5rem 0;
     }
     .dashboard-header h1 {
-        font-family: 'Inter', sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         font-size: 2.4rem;
         font-weight: 800;
         background: linear-gradient(135deg, #60a5fa 0%, #a78bfa 50%, #f472b6 100%);
@@ -162,7 +172,7 @@ CUSTOM_CSS = """
 
     /* ── Section titles ────────────────────────────────────────── */
     .section-title {
-        font-family: 'Inter', sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         font-size: 1.2rem;
         font-weight: 700;
         color: #e5e7eb;
@@ -203,7 +213,7 @@ CUSTOM_CSS = """
         border-spacing: 0;
         border-radius: 0.75rem;
         overflow: hidden;
-        font-family: 'Inter', sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         font-size: 0.82rem;
     }
     .heuristic-table th {
@@ -250,7 +260,7 @@ CUSTOM_CSS = """
         margin-bottom: 1rem;
     }
     .tx-detail-card .tx-hash {
-        font-family: 'JetBrains Mono', monospace;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
         font-size: 0.82rem;
         color: #a5b4fc;
         word-break: break-all;
@@ -369,13 +379,15 @@ with st.sidebar:
     st.markdown("##### 📂 Data Source")
 
     uploaded_file = st.file_uploader(
-        "Upload Bitcoin Traffic CSV",
-        type=["csv"],
-        help="Upload a raw CSV with columns: timestamp, src_ip, dst_ip, "
-             "src_port, dst_port, txid, input_addresses, output_addresses, "
-             "input_amounts, output_amounts, fee, script_type, geo_country",
-        key="csv_upload",
+        "Upload Transaction Data",
+        type=["csv", "json", "xml"],
+        help="Upload raw transactions. The appropriate adapter will be automatically selected based on file extension.",
+        key="data_upload",
     )
+    if uploaded_file:
+        st.info(f"✅ Currently using: **{uploaded_file.name}**")
+    else:
+        st.info("📄 Currently using default: **synthetic_transactions.csv**")
 
     uploaded_whitelist = st.file_uploader(
         "Upload Custom Whitelist CSV",
@@ -383,6 +395,10 @@ with st.sidebar:
         help="CSV with columns: address, entity_name, risk_override",
         key="whitelist_upload",
     )
+    if uploaded_whitelist:
+        st.info(f"✅ Currently using: **{uploaded_whitelist.name}**")
+    else:
+        st.info("📄 Currently using default: **institutional_whitelist.csv**")
 
     st.markdown("---")
 
@@ -481,17 +497,15 @@ with st.sidebar:
 # Data loading & pipeline execution
 # ---------------------------------------------------------------------------
 
-_adapter = BitcoinCSVAdapter()
-
 # Handle custom whitelist upload
 if uploaded_whitelist is not None:
     custom_wl = pd.read_csv(uploaded_whitelist)
     custom_wl.to_csv("institutional_whitelist.csv", index=False)
 
 
-def run_ai_on_upload(raw_df: pd.DataFrame, cont: float):
+def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
     """Run the full AI pipeline via the polymorphic adapter."""
-    enriched_df, _model, features = _adapter.run_pipeline_from_df(
+    enriched_df, _model, features = adapter.run_pipeline_from_df(
         raw_df, contamination=cont,
     )
     return enriched_df, features
@@ -500,14 +514,20 @@ def run_ai_on_upload(raw_df: pd.DataFrame, cont: float):
 # Determine data source and load
 if uploaded_file is not None:
     try:
-        raw_df = pd.read_csv(uploaded_file)
-        missing = [c for c in REQUIRED_COLUMNS if c not in raw_df.columns]
-        if missing:
-            st.error(f"❌ **Missing columns:** {', '.join(missing)}")
-            st.stop()
+        # Save to a temporary file so the adapter can determine format by extension
+        ext = os.path.splitext(uploaded_file.name)[1]
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
+
+        try:
+            adapter = get_adapter(tmp_path)
+            raw_df = adapter.load(tmp_path)
+        finally:
+            os.remove(tmp_path)
 
         with st.spinner("🧠 AI Engine running — detecting anomalies..."):
-            df, features_df = run_ai_on_upload(raw_df, contamination)
+            df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
             data_source = "uploaded"
 
         with st.sidebar:
@@ -524,9 +544,10 @@ if uploaded_file is not None:
         st.stop()
 elif os.path.isfile("bitcoin_traffic.csv"):
     try:
-        raw_df = pd.read_csv("bitcoin_traffic.csv")
+        adapter = get_adapter("bitcoin_traffic.csv")
+        raw_df = adapter.load("bitcoin_traffic.csv")
         with st.spinner("🧠 AI Engine running on default dataset..."):
-            df, features_df = run_ai_on_upload(raw_df, contamination)
+            df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
             data_source = "default"
     except Exception as e:
         import traceback
@@ -646,9 +667,9 @@ with tab1:
             </div>
             <div class="bento-card card-cyan">
                 <div class="card-icon">⚠️</div>
-                <div class="card-label">Max Risk Score</div>
+                <div class="card-label">Max Investigative Priority Index</div>
                 <div class="card-value">{max_risk:.1f}%</div>
-                <div class="card-sub">Highest threat confidence level</div>
+                <div class="card-sub">Highest anomaly deviation from baseline</div>
             </div>
         </div>
         """,
@@ -729,7 +750,7 @@ with tab1:
             f"  Peel Chains Detected:        {peel_count}",
             f"  Fan-Out Dispersals:          {fanout_count}",
             f"  Fee-Spike Urgency Hops:      {feespike_count}",
-            f"  Max Risk Score:              {max_risk:.1f}%",
+            f"  Max Investigative Priority Index: {max_risk:.1f}%",
             "",
             "-" * 70,
             "  FLAGGED TRANSACTIONS",
@@ -740,7 +761,7 @@ with tab1:
         if total_flagged > 0:
             for _, row in flagged_df.sort_values("risk_score", ascending=False).iterrows():
                 report_lines.append(f"  TXID: {row['txid']}")
-                report_lines.append(f"  Risk: {row['risk_score']:.1f}%  |  Entity: {row.get('entity_id', 'N/A')}")
+                report_lines.append(f"  Priority: {row['risk_score']:.1f}%  |  Entity: {row.get('entity_id', 'N/A')}")
                 report_lines.append(f"  Source IP: {row['src_ip']}  |  Port: {row['src_port']}")
                 report_lines.append(f"  Amount: {row.get('total_amount_btc', 'N/A')} BTC  |  Fee: {row['fee']}")
                 report_lines.append(f"  {row['explanation']}")
@@ -754,7 +775,7 @@ with tab1:
 
         report_text = "\n".join(report_lines)
         st.download_button(
-            label="📄 Download Court-Ready Report",
+            label="📄 Generate Evidence Dossier",
             data=report_text.encode("utf-8"),
             file_name="mithya_forensic_report.txt",
             mime="text/plain",
@@ -911,10 +932,21 @@ with tab3:
                 unsafe_allow_html=True,
             )
 
+    # ── Target Entity Isolation ──
+    sorted_df = df.sort_values("risk_score", ascending=False)
+    unique_entities = sorted_df["entity_id"].dropna().unique().tolist()
+    entity_options = ["View Full Graph"] + unique_entities
+
+    target_entity = st.selectbox(
+        "🎯 Isolate Target Entity (Wallet Address)",
+        entity_options,
+        help="Select a specific entity to view its localized subgraph (ego network) up to 2 hops away."
+    )
+
     MAX_CONTEXT_NORMAL = 50
     MAX_CLEAN_SAMPLE = 40
 
-    def build_network_graph(graph_df: pd.DataFrame, threats_only_mode: bool = True) -> str:
+    def build_network_graph(graph_df: pd.DataFrame, threats_only_mode: bool = True, target_entity: str = "View Full Graph") -> str:
         """Build a focused, intelligence-style tripartite network graph."""
         net = Network(
             height="580px",
@@ -985,6 +1017,8 @@ with tab3:
         else:
             plot_df = pd.concat([anom_rows, context_rows]).drop_duplicates()
 
+        import networkx as nx
+        temp_nx = nx.DiGraph()
         added_nodes: set = set()
 
         for _, row in plot_df.iterrows():
@@ -1008,7 +1042,7 @@ with tab3:
                 else:
                     ip_color, ip_size = "#3b82f6", 14
                     ip_title = f"IP: {src_ip}"
-                net.add_node(src_ip, label=src_ip, color=ip_color, size=ip_size, shape="dot", title=ip_title)
+                temp_nx.add_node(src_ip, label=src_ip, color=ip_color, size=ip_size, shape="dot", title=ip_title)
                 added_nodes.add(src_ip)
 
             # ─── TX node ───
@@ -1023,22 +1057,25 @@ with tab3:
                 else:
                     tx_color, tx_size = "#6b7280", 8
                     tx_title = f"TX: {txid}\nAmount: {amount} BTC"
-                net.add_node(txid, label=tx_label, color=tx_color, size=tx_size, shape="diamond", title=tx_title)
+                temp_nx.add_node(txid, label=tx_label, color=tx_color, size=tx_size, shape="diamond", title=tx_title)
                 added_nodes.add(txid)
 
             # ─── Entity node ───
             if entity not in added_nodes:
                 if is_regulated:
-                    ent_color, ent_size = "#4ade80", 28
+                    ent_color, ent_size = "#10b981", 28  # Emerald Green
                     ent_title = f"✅ REGULATED ENTITY: {entity}"
+                    display_label = f"{entity} 🛡️"
                 elif is_anom or entity in anom_entities:
-                    ent_color, ent_size = "#9b59b6", 30
+                    ent_color, ent_size = "#dc2626", 30  # Crimson
                     ent_title = f"⚠️ HIGH-RISK ENTITY: {entity}"
+                    display_label = entity
                 else:
                     ent_color, ent_size = "#9b59b6", 22
                     ent_title = f"Entity Cluster: {entity}"
-                net.add_node(
-                    entity, label=entity, color=ent_color, size=ent_size, shape="square",
+                    display_label = entity
+                temp_nx.add_node(
+                    entity, label=display_label, color=ent_color, size=ent_size, shape="square",
                     title=ent_title, borderWidth=3,
                     font={"size": 14, "color": "#ffffff", "bold": True},
                 )
@@ -1052,8 +1089,20 @@ with tab3:
             else:
                 edge_color, edge_width = "rgba(107, 114, 128, 0.35)", 0.7
 
-            net.add_edge(src_ip, txid, color=edge_color, width=edge_width, title=f"Node: {country}")
-            net.add_edge(entity, txid, color=edge_color, width=edge_width, title="Inputs owned by entity")
+            temp_nx.add_edge(src_ip, txid, color=edge_color, width=edge_width, title=f"Node: {country}")
+            temp_nx.add_edge(entity, txid, color=edge_color, width=edge_width, title="Inputs owned by entity")
+
+        # ── Filter using ego_graph if a target is selected ──
+        if target_entity != "View Full Graph" and target_entity in temp_nx.nodes:
+            filtered_nx = nx.ego_graph(temp_nx, target_entity, radius=2, undirected=True)
+        else:
+            filtered_nx = temp_nx
+
+        # ── Populate PyVis Network from the filtered subgraph ──
+        for node_id, node_attrs in filtered_nx.nodes(data=True):
+            net.add_node(node_id, **node_attrs)
+        for source, target, edge_attrs in filtered_nx.edges(data=True):
+            net.add_edge(source, target, **edge_attrs)
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w")
         net.save_graph(tmp.name)
@@ -1062,52 +1111,50 @@ with tab3:
         return html_content
 
     st.markdown('<div class="graph-container">', unsafe_allow_html=True)
-    graph_html = build_network_graph(df, threats_only_mode=threats_only)
+    graph_html = build_network_graph(df, threats_only_mode=threats_only, target_entity=target_entity)
     components.html(graph_html, height=600, scrolling=False)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TAB 4: ADVANCED HEURISTICS INSPECTOR
+# TAB 4: ANALYTICAL EXPLAINABILITY PANEL
 # ═══════════════════════════════════════════════════════════════════════════
 
 with tab4:
     st.markdown(
-        '<div class="section-title"><span class="icon">🔬</span> Advanced Heuristics Inspector</div>'
-        '<p class="section-subtitle">Select any transaction to inspect its full heuristic telemetry</p>',
+        '<div class="section-title"><span class="icon">📐</span> Analytical Explainability Panel</div>'
+        '<p class="section-subtitle">Select any transaction to inspect its dynamic feature percentiles and statistical deviations.</p>',
         unsafe_allow_html=True,
     )
 
     # ── Transaction selector ──
     sorted_df = df.sort_values("risk_score", ascending=False)
     tx_options = [
-        f"{row['txid'][:12]}… | Risk: {row['risk_score']:.1f}% | {row.get('attack_type', 'N/A')}"
+        f"{row['txid'][:12]}… | Priority: {row['risk_score']:.1f}% | {row.get('attack_type', 'N/A')}"
         for _, row in sorted_df.iterrows()
     ]
     txid_map = {opt: row["txid"] for opt, (_, row) in zip(tx_options, sorted_df.iterrows())}
 
     selected_tx_label = st.selectbox(
         "Select Transaction",
-        tx_options[:200],  # limit dropdown for performance
-        help="Sorted by risk score (highest first). Select any transaction to inspect.",
+        tx_options[:200],
+        help="Sorted by Investigative Priority Index. Select any transaction to inspect.",
     )
 
     if selected_tx_label:
         selected_txid = txid_map[selected_tx_label]
         tx_row = df[df["txid"] == selected_txid].iloc[0]
         tx_idx = df[df["txid"] == selected_txid].index[0]
-
-        # Get feature values for this transaction
         feat_row = features_df.iloc[tx_idx]
 
         # ── Transaction detail card ──
         risk_val = tx_row["risk_score"]
-        if risk_val >= 70:
+        if risk_val >= 80:
             risk_badge = '<span class="badge badge-red">CRITICAL</span>'
-        elif risk_val >= 40:
-            risk_badge = '<span class="badge badge-amber">ELEVATED</span>'
+        elif risk_val >= 50:
+            risk_badge = '<span class="badge badge-amber">HIGH</span>'
         elif risk_val > 0:
-            risk_badge = '<span class="badge badge-blue">LOW</span>'
+            risk_badge = '<span class="badge badge-blue">NORMAL</span>'
         else:
             risk_badge = '<span class="badge badge-green">CLEAR</span>'
 
@@ -1141,7 +1188,7 @@ with tab4:
                 <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 1rem; font-size: 0.82rem;">
                     <div>
                         <div style="color: #9ca3af; font-size: 0.68rem; text-transform: uppercase;">Source IP</div>
-                        <div style="color: #e5e7eb; font-family: 'JetBrains Mono', monospace;">{tx_row['src_ip']}</div>
+                        <div style="color: #e5e7eb; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">{tx_row['src_ip']}</div>
                     </div>
                     <div>
                         <div style="color: #9ca3af; font-size: 0.68rem; text-transform: uppercase;">Ports</div>
@@ -1171,104 +1218,60 @@ with tab4:
                     🧠 AI Explanation
                 </div>
                 <div style="color: #d1d5db; font-size: 0.85rem; line-height: 1.5;">
-                    {tx_row['explanation']}
+                    {tx_row.get('explanation', 'No explanation available.')}
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        # ── Heuristic Telemetry Table ──
-        st.markdown(
-            '<div class="section-title"><span class="icon">📐</span> Heuristic Telemetry</div>',
-            unsafe_allow_html=True,
-        )
-
-        # Compute per-transaction heuristic values
-        peel_val = feat_row.get("peel_chain_disparity", 0)
-        fan_in_val = int(feat_row.get("fan_in", 0))
-        fan_out_val = int(feat_row.get("fan_out", 0))
-        fan_ratio_val = feat_row.get("fan_ratio", 0)
-        fee_urgency_val = feat_row.get("fee_rate_urgency", 0)
-        zscore_val = feat_row.get("value_zscore", 0)
-        zscore_abs = feat_row.get("value_zscore_abs", 0)
-        port_risk_val = feat_row.get("port_risk_combined", 0)
-        entity_ip_div = feat_row.get("entity_ip_diversity", 0)
-        is_micro = int(feat_row.get("is_micro_tx", 0))
-        is_mixer = is_mixer_transaction(tx_row)
-
-        def _check(triggered: bool) -> str:
-            return '<span style="color: #f87171; font-weight: 700;">✅ TRIGGERED</span>' if triggered else '<span style="color: #6b7280;">—</span>'
-
-        heuristic_rows = f"""
-        <tr>
-            <td><b>Mixer Signature</b></td>
-            <td style="font-family: 'JetBrains Mono', monospace;">{'True' if is_mixer else 'False'}</td>
-            <td>equal-output ratio ≥ 50%</td>
-            <td>{_check(is_mixer)}</td>
-        </tr>
-        <tr>
-            <td><b>Peel Chain Disparity</b></td>
-            <td style="font-family: 'JetBrains Mono', monospace;">{peel_val:.4f}</td>
-            <td>&gt; 0.0</td>
-            <td>{_check(peel_val > 0)}</td>
-        </tr>
-        <tr>
-            <td><b>Fan-In / Fan-Out</b></td>
-            <td style="font-family: 'JetBrains Mono', monospace;">{fan_in_val} → {fan_out_val} (ratio: {fan_ratio_val:.4f})</td>
-            <td>ratio &lt; 0.2 &amp; fan_out &gt; 5</td>
-            <td>{_check(fan_ratio_val < 0.2 and fan_out_val > 5)}</td>
-        </tr>
-        <tr>
-            <td><b>Fee Rate Urgency</b></td>
-            <td style="font-family: 'JetBrains Mono', monospace;">{fee_urgency_val:.6f}</td>
-            <td>&gt; 0.05</td>
-            <td>{_check(fee_urgency_val > 0.05)}</td>
-        </tr>
-        <tr>
-            <td><b>Value Z-Score</b></td>
-            <td style="font-family: 'JetBrains Mono', monospace;">{zscore_val:.4f} (abs: {zscore_abs:.4f})</td>
-            <td>|Z| &gt; 2.5</td>
-            <td>{_check(zscore_abs > 2.5)}</td>
-        </tr>
-        <tr>
-            <td><b>Port Risk Combined</b></td>
-            <td style="font-family: 'JetBrains Mono', monospace;">{port_risk_val:.4f}</td>
-            <td>≥ 0.6</td>
-            <td>{_check(port_risk_val >= 0.6)}</td>
-        </tr>
-        <tr>
-            <td><b>Entity IP Diversity</b></td>
-            <td style="font-family: 'JetBrains Mono', monospace;">{int(entity_ip_div)}</td>
-            <td>&gt; 2 IPs</td>
-            <td>{_check(entity_ip_div > 2)}</td>
-        </tr>
-        <tr>
-            <td><b>Micro Transaction</b></td>
-            <td style="font-family: 'JetBrains Mono', monospace;">{'Yes' if is_micro else 'No'}</td>
-            <td>amount &lt; 0.006 BTC</td>
-            <td>{_check(is_micro == 1)}</td>
-        </tr>
-        """
-
-        st.markdown(
-            f"""
-            <table class="heuristic-table">
-                <thead>
-                    <tr>
-                        <th>Heuristic</th>
-                        <th>Value</th>
-                        <th>Threshold</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {heuristic_rows}
-                </tbody>
-            </table>
-            """,
-            unsafe_allow_html=True,
-        )
+        # ── Telemetry Table ──
+        telemetry_str = tx_row.get("telemetry", "")
+        if isinstance(telemetry_str, str) and telemetry_str.strip():
+            try:
+                telemetry_data = json.loads(telemetry_str)
+                if telemetry_data:
+                    heuristic_rows = ""
+                    for item in telemetry_data:
+                        fname = item.get("label", item.get("feature_name", ""))
+                        obs = item.get("observed_value", 0.0)
+                        p_rank = item.get("percentile_rank", 0.0)
+                        med = item.get("dataset_median", 0.0)
+                        reason = item.get("audit_reason", "")
+                        
+                        heuristic_rows += f"""
+                        <tr>
+                            <td><b>{fname}</b></td>
+                            <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">{obs:.4f}</td>
+                            <td>{p_rank:.1f}th Percentile (Med: {med:.4f})</td>
+                            <td style="color: #f87171;">{reason}</td>
+                        </tr>
+                        """
+                    
+                    st.markdown(
+                        f"""
+                        <table class="heuristic-table">
+                            <thead>
+                                <tr>
+                                    <th>Feature</th>
+                                    <th>Value</th>
+                                    <th>Statistical Deviation</th>
+                                    <th>Audit Reason</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {heuristic_rows}
+                            </tbody>
+                        </table>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.info("No extreme statistical deviations detected for this transaction.")
+            except Exception as e:
+                st.error("Error parsing telemetry data.")
+        else:
+            st.info("No structured telemetry data available for this transaction.")
 
         # ── Address Flow Detail ──
         st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)

@@ -24,11 +24,12 @@ MITHYA addresses the core challenges of crypto-investigations:
 |---|---|
 | **Mixer/CoinJoin Bypass** | Detects equal-output signatures (`equal_output_ratio=0.50`) and blocks false entity aggregation. |
 | **Change-Address Detection** | 5-factor heuristic (script-type match, unrounded remainder, decimal precision, novelty, asymmetry) links change outputs back to sender entity. |
-| **Port Risk Telemetry** | Scores network ports (`0.0` to `1.0`) to flag proxies and ephemeral routing, discarding static Geo-IP. |
-| **Behavioral ML** | 18 engineered features (e.g., Peel Chain Disparity, Fan-In/Out) fed into an Isolation Forest model. |
-| **Institutional Whitelist** | Pre-clears known safe addresses via `institutional_whitelist.csv` to eliminate false positives. |
-| **Abstract Ingestion Adapter** | Implements the Adapter pattern (`BaseTransactionAdapter`) ensuring cross-chain compatibility. |
-| **Advanced 4-Tab UI** | Streamlit dashboard with Overview, Entity Attribution, PyVis Graph, and Advanced Heuristics Inspector. |
+| **Port Risk Telemetry** | Scores network ports to flag proxies and ephemeral routing, discarding static Geo-IP (now explicitly bypassing standard ports like 443). |
+| **Behavioral ML** | 18 engineered features (e.g., True Multi-Hop Peel Chains, Fan-In/Out) fed into an Isolation Forest model to generate an objective **Anomaly Score**. |
+| **Institutional Whitelist** | Zeroes out risk for specific institutional nodes (e.g., Binance) while preserving the anomaly scores of counterparties and transfer edges. |
+| **Abstract Ingestion Adapter** | Implements the Adapter pattern (`BaseTransactionAdapter`) ensuring cross-chain compatibility for **.csv, .json, and .xml** formats. |
+| **Advanced 4-Tab UI** | Streamlit dashboard with Overview, Entity Attribution, PyVis Graph, and an Analytical Explainability Panel. |
+| **Strict Air-Gapped Security**| The Streamlit UI explicitly blocks all external CDNs, Google Fonts, and outbound sockets to guarantee 100% offline execution. |
 | **Court-Ready Exports** | One-click export of a full forensic summary report detailing ML alerts and heuristic reasoning. |
 
 ---
@@ -129,16 +130,14 @@ The pipeline computes these features in `engineer_features()`:
 
 ## 7. Explainable AI / Output Logic
 
-The `generate_explanation()` function constructs human-readable reasons by evaluating the feature vector against specific thresholds:
+The `explainability.py` module constructs human-readable reasons by evaluating the feature vector dynamically against dataset percentiles rather than rigid, hardcoded thresholds. It generates a statistical **Investigative Priority Index** and an **Anomaly Score**, completely eliminating subjective metrics like "Guilt Probability."
 
-*   **Port Anomaly (`port_risk_combined >= 0.6`):** `"Anomalous port profile (src:{} / dst:{}) — possible proxy/Tor/tunneling"`
-*   **Peel Chain (`peel_chain_disparity > 0`):** `"Peel-chain output structure detected (disparity={}) — classic layering signature"`
-*   **Mass Consolidation (`fan_ratio > 5`):** `"Mass consolidation ({} inputs → {} outputs, ratio={})"`
-*   **Rapid Dispersal (`fan_ratio < 0.2` and `fan_out > 5`):** `"Rapid dispersal ({} inputs → {} outputs, ratio={})"`
-*   **Fee Urgency (`fee_rate_urgency > 0.05`):** `"Fee-rate urgency ({}) — miner-priority overpayment suggesting time-sensitive hop"`
-*   **Volume Outlier (`value_zscore_abs > 2.5`):** `"Volume outlier (Z-score={}) — statistically anomalous transaction value"`
-*   **IP Anonymization (`entity_ip_diversity > 2`):** `"Entity uses multiple distinct IPs ({} IPs), suggesting anonymization"`
-*   **Botnet Relay (`ip_entity_diversity > 2`):** `"IP {} broadcasts for multiple distinct entities, acting as a high-traffic node"`
+*   **Port Anomaly:** `"Anomalous port profile — possible proxy/Tor/tunneling"`
+*   **True Multi-Hop Peel Chain:** `"Peel-chain output structure detected across sequential hops — classic layering signature"`
+*   **Mass Consolidation / Rapid Dispersal:** Triggers based on percentile-ranked fan-out ratios.
+*   **Fee Urgency:** `"Fee-rate urgency — miner-priority overpayment suggesting time-sensitive hop"`
+*   **Volume Outlier:** Statistically anomalous transaction values evaluated against baseline medians.
+*   **IP Anonymization / Botnet Relay:** Flagged when `entity_ip_diversity` or `ip_entity_diversity` drastically exceeds the 95th percentile.
 
 ---
 
@@ -162,9 +161,9 @@ The Streamlit interface (`app.py`) provides a robust 4-tab intelligence architec
     *   PyVis Network Graph with `forceAtlas2Based` physics.
     *   🔍 Threat-Centric Mode Toggle: View only flagged threats or broader network activity.
     *   Color-coded nodes: 🔴 Suspicious, 🔵 Normal, 🟢 Regulated, 🟣 Entity Clusters.
-*   **Tab 4 - 🔬 Heuristics Inspector:**
-    *   Interactive drill-down panel for selected transactions.
-    *   Displays exactly which of the 18 mathematical heuristics triggered for the chosen entity.
+*   **Tab 4 - 🔬 Analytical Explainability Panel:**
+    *   Interactive drill-down panel for selected transactions based on their Investigative Priority Index.
+    *   Displays dynamic statistical percentile deviations mapping exact feature values to baseline dataset medians.
 
 ---
 
@@ -174,11 +173,14 @@ The Streamlit interface (`app.py`) provides a robust 4-tab intelligence architec
 SIH-2026-2/
 ├── generate_data.py            # Generates synthetic P2P traffic dataset (CLI arguments supported)
 ├── ml_engine.py                # Core ML pipeline, graph logic, and XAI generator
-├── transaction_adapter.py      # BaseTransactionAdapter and BitcoinCSVAdapter
+├── transaction_adapter.py      # Cross-format adapter (CSV, JSON, XML)
 ├── app.py                      # Streamlit 4-tab frontend UI and PyVis rendering
-├── bitcoin_traffic.csv         # Raw synthetic dataset
-├── institutional_whitelist.csv # Offline CSV mapped to safe entity addresses
-├── requirements.txt            # Python pip dependencies
+├── requirements-lock.txt       # Strict locked Python pip dependencies for offline reproducibility
+├── Dockerfile                  # Container definition for air-gapped deployment
+├── tests/                      # Pytest automation suite (adapters, heuristics, airgap, whitelist)
+├── sample_data/                # Pre-built fixtures (bitcoin_traffic.csv, .json, .xml, whitelist)
+├── evaluation/                 # Benchmarking execution speed and memory footprint
+├── docs/                       # Architectural MODEL_CARD.md and DATASET_CARD.md
 └── README.md                   # This documentation file
 ```
 
@@ -218,15 +220,16 @@ SIH-2026-2/
 
 | Requirement | Implementation | Status |
 |---|---|---|
-| Offline Linux Operation | Python, Sklearn, NetworkX | ✅ Completed |
-| Ingest bulk CSV metadata | `transaction_adapter.py` | ✅ Completed |
+| Offline Air-Gapped Operation | Socket-blocking, native fonts, offline Dockerfile | ✅ Completed |
+| Ingest bulk Multi-Format metadata | `transaction_adapter.py` (CSV, JSON, XML) | ✅ Completed |
 | Entity/transaction graph | `build_entity_graph()` in `ml_engine.py` | ✅ Completed |
 | AI anomaly detection | `IsolationForest` on 18 features | ✅ Completed |
 | Wallet clustering | Union-Find via `nx.connected_components` | ✅ Completed |
-| Change-address detection | `detect_change_address()` 5-factor heuristic | ✅ Completed |
-| Explainable alerts | `generate_explanation()` logic | ✅ Completed |
+| True Multi-Hop Peel Chains | Multi-step tracing sequences across hops | ✅ Completed |
+| Entity-Level Whitelisting | Counters risk for institutional nodes exclusively | ✅ Completed |
+| Explainable alerts | Percentile-based statistical telemetry profiling | ✅ Completed |
 | Interactive UI | `app.py` Streamlit + PyVis | ✅ Completed |
-| Actionable Intelligence | Advanced Heuristics Inspector & Exports | ✅ Completed |
+| Actionable Intelligence | Analytical Explainability Panel & Exports | ✅ Completed |
 
 ---
 
