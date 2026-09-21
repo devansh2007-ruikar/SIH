@@ -1,6 +1,7 @@
 import os
 import sys
 import socket
+# pyrefly: ignore [missing-import]
 import pytest
 
 # Ensure project root is on path

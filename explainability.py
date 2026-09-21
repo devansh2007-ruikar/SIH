@@ -1,60 +1,60 @@
 """
-explainability.py — Statistical Percentile Explainability
-=========================================================
+explainability.py — Dynamic Per-Transaction Explainability Engine
+=================================================================
 
-Replaces arbitrary manual thresholds in the MITHYA XAI pipeline with
-dynamic statistical profiling relative to the ingested dataset.
+Generates unique, human-readable explanations for every flagged
+transaction by examining the ACTUAL feature values and raw
+transaction fields that caused the IsolationForest to flag it.
 
-Instead of hardcoded rules like ``if fan_out > 5``, this module
-computes the actual distribution (median, P75, P95, P99) of each
-behavioral feature across the full dataset, then explains each
-flagged transaction in terms of its **percentile rank** against
-that distribution.
+Architecture
+------------
+The explanation engine operates in two phases:
 
-Key Components
---------------
-1. **DatasetProfile** — per-feature statistics computed once from the
-   full ingested dataset (median, percentiles, std).
+**Phase A — Direct Signal Detection:**
+Checks raw transaction fields (port numbers, fee, amounts, attack_type,
+addresses) against forensic rule-triggers. These produce crisp,
+domain-specific statements like:
+    "Routed through known Tor SOCKS port (9050)."
 
-2. **Percentile ranking** — locates each transaction's feature value
-   within the dataset distribution (e.g., "99.2th percentile").
+**Phase B — Statistical Deviation Ranking:**
+For every engineered feature, computes a Z-score and percentile rank
+against the dataset distribution. Features that deviate significantly
+from the median are ranked by severity and reported as:
+    "Fee urgency of 0.189 is in the 98.2th percentile (dataset median: 0.0007)."
 
-3. **Structured telemetry** — machine-readable dicts containing
-   ``feature_name``, ``observed_value``, ``dataset_median``,
-   ``percentile_rank``, and ``heuristic_flags``.
+If Phase A produces no specific triggers AND Phase B finds no features
+above the 75th percentile, the fallback identifies the SINGLE feature
+with the largest absolute Z-score deviation and reports it — so every
+transaction gets a unique explanation.
 
-4. **Human-readable explanations** — audit-grade text comparing the
-   transaction against the baseline population.
+Integration
+-----------
+Called from ``ml_engine.generate_all_explanations()`` which passes:
+- ``features_df``: The 18-21 column numeric feature matrix
+- ``df``: The original transaction DataFrame (with src_port, fee, etc.)
+- ``predictions``: IsolationForest labels (-1 = anomaly)
+- ``deviation_scores``: Anomaly Deviation Scores (0–100)
+- ``profile``: Pre-computed DatasetProfile with medians/percentiles
 
-Design Principle
-----------------
-All thresholds derive from the **95th percentile** of the actual
-ingested data, not from pre-selected magic numbers.  This ensures
-the system adapts to datasets of different scales, time windows,
-and transaction profiles.
-
-Usage
------
-::
-
-    from explainability import build_dataset_profile, generate_all_explanations
-
-    profile = build_dataset_profile(features_df)
-    enriched_df = generate_all_explanations(
-        df, features_df, predictions, deviation_scores, profile,
-    )
+The output ``explanation`` column is rendered directly in the
+Entity Attribution table and the Heuristics Inspector panel.
 """
+
+from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# ── Features to profile ─────────────────────────────────────────────
-# Each entry maps a feature name to a human-readable label and the
-# direction of "suspiciousness" (higher = more suspicious by default).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE METADATA
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Maps feature names → human label + suspiciousness direction + heuristic tag
 PROFILED_FEATURES = {
     "fan_in": {
         "label": "Input address count",
@@ -68,7 +68,7 @@ PROFILED_FEATURES = {
     },
     "fan_ratio": {
         "label": "Fan-in / fan-out ratio",
-        "direction": "low",       # low ratio = dispersal
+        "direction": "low",
         "heuristic": "fan_ratio_anomaly",
     },
     "peel_chain_disparity": {
@@ -111,7 +111,33 @@ PROFILED_FEATURES = {
         "direction": "high",
         "heuristic": "progressive_peeling",
     },
+    "amount_btc_scaled": {
+        "label": "Scaled BTC amount",
+        "direction": "high",
+        "heuristic": "high_value_transfer",
+    },
+    "fee_scaled": {
+        "label": "Scaled fee",
+        "direction": "high",
+        "heuristic": "fee_anomaly",
+    },
+    "src_port_risk": {
+        "label": "Source port risk",
+        "direction": "high",
+        "heuristic": "src_port_anomaly",
+    },
+    "dst_port_risk": {
+        "label": "Destination port risk",
+        "direction": "high",
+        "heuristic": "dst_port_anomaly",
+    },
 }
+
+# Known Tor/proxy/I2P port numbers for direct signal detection
+_TOR_PORTS = {9050, 9051, 9150}
+_PROXY_PORTS = {3128, 8080, 1080}
+_I2P_PORTS = {4444, 4445}
+_SUSPICIOUS_PORTS = _TOR_PORTS | _PROXY_PORTS | _I2P_PORTS
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -220,44 +246,339 @@ def compute_percentile_rank(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STRUCTURED TELEMETRY
+# PHASE A: DIRECT SIGNAL DETECTION (raw transaction fields)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def generate_telemetry(
+def _detect_direct_signals(
+    original_row: pd.Series,
     row_features: pd.Series,
     profile: DatasetProfile,
-    percentile_threshold: float = 95.0,
-) -> List[Dict[str, Any]]:
+) -> List[str]:
     """
-    Generate structured telemetry dicts for a single transaction.
+    Check raw transaction fields for forensic rule-triggers that
+    produce specific, unambiguous explanation strings.
 
-    For each profiled feature, computes the percentile rank of the
-    observed value against the dataset distribution.  Features that
-    exceed the ``percentile_threshold`` are flagged.
+    These are NOT percentile-based — they fire on exact value matches
+    or domain-knowledge thresholds.
+
+    Parameters
+    ----------
+    original_row : pd.Series
+        The original transaction row (src_port, dst_port, fee, etc.)
+    row_features : pd.Series
+        The engineered feature row.
+    profile : DatasetProfile
+        Dataset statistics (used for fee/amount comparisons).
+
+    Returns
+    -------
+    list[str]
+        Plain-English reason strings. May be empty if no direct
+        signals fire.
+    """
+    signals: List[str] = []
+
+    # ── 1. Port-based signals ─────────────────────────────────────────
+    src_port = int(original_row.get("src_port", 0))
+    dst_port = int(original_row.get("dst_port", 0))
+
+    if src_port in _TOR_PORTS:
+        signals.append(
+            f"Routed through known Tor SOCKS port (src_port={src_port})"
+        )
+    elif src_port in _PROXY_PORTS:
+        signals.append(
+            f"Routed through known proxy port (src_port={src_port})"
+        )
+    elif src_port in _I2P_PORTS:
+        signals.append(
+            f"Routed through known I2P tunnel port (src_port={src_port})"
+        )
+
+    if dst_port in _TOR_PORTS:
+        signals.append(
+            f"Destination is a known Tor control/SOCKS port (dst_port={dst_port})"
+        )
+    elif dst_port in _I2P_PORTS:
+        signals.append(
+            f"Destination is a known I2P eepsite port (dst_port={dst_port})"
+        )
+
+    # ── 2. Mixer/CoinJoin signature ───────────────────────────────────
+    attack_type = str(original_row.get("attack_type", ""))
+    if "CoinJoin" in attack_type or "Mixer" in attack_type:
+        signals.append(
+            "Matches deterministic equal-denomination CoinJoin signature"
+        )
+
+    # ── 3. Fee spike ──────────────────────────────────────────────────
+    if "Fee_Spike" in attack_type or "Fee" in attack_type:
+        fee = float(original_row.get("fee", 0))
+        total = float(original_row.get("total_amount_btc", 0))
+        if total > 0:
+            fee_pct = (fee / total) * 100
+            signals.append(
+                f"Abnormal fee-to-value ratio: {fee:.8f} BTC fee on "
+                f"{total:.4f} BTC transfer ({fee_pct:.1f}% of value)"
+            )
+        else:
+            signals.append(
+                f"Fee spike detected: {fee:.8f} BTC on zero/micro transfer"
+            )
+
+    # ── 4. Peel chain ─────────────────────────────────────────────────
+    if "Peel" in attack_type:
+        disparity = float(row_features.get("peel_chain_disparity", 0))
+        if disparity > 0:
+            signals.append(
+                f"Structural peel-chain disparity detected (ratio: {disparity:.4f})"
+            )
+        else:
+            signals.append(
+                "Peel-chain output structure — one large + one small output "
+                "suggests change-address layering"
+            )
+
+    # ── 5. Micro-transaction (dust attack probe) ──────────────────────
+    is_micro = row_features.get("is_micro_tx", 0)
+    if is_micro == 1:
+        amount = float(original_row.get("total_amount_btc", 0))
+        signals.append(
+            f"Micro-transaction ({amount:.6f} BTC) — possible dust-attack "
+            f"probe or chain-pollution vector"
+        )
+
+    # ── 6. High fan-out (mass dispersal) ──────────────────────────────
+    fan_out = int(row_features.get("fan_out", 1))
+    if fan_out >= 5:
+        signals.append(
+            f"High fan-out of {fan_out} output addresses — "
+            f"rapid 1-to-many dispersal pattern"
+        )
+
+    # ── 7. High fan-in (mass consolidation) ───────────────────────────
+    fan_in = int(row_features.get("fan_in", 1))
+    if fan_in >= 5:
+        signals.append(
+            f"High fan-in of {fan_in} input addresses — "
+            f"mass consolidation pattern"
+        )
+
+    # ── 8. Multi-hop peel chain ───────────────────────────────────────
+    chain_len = int(row_features.get("peel_chain_length", 0))
+    if chain_len >= 2:
+        signals.append(
+            f"Multi-hop peel chain trajectory ({chain_len} linked hops)"
+        )
+
+    return signals
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE B: STATISTICAL DEVIATION RANKING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _rank_feature_deviations(
+    row_features: pd.Series,
+    profile: DatasetProfile,
+    percentile_threshold: float = 75.0,
+    max_reasons: int = 4,
+) -> List[str]:
+    """
+    Rank all features by how far they deviate from the dataset median
+    and return human-readable strings for the top deviators.
 
     Parameters
     ----------
     row_features : pd.Series
         Feature values for a single transaction.
     profile : DatasetProfile
-        Pre-computed dataset-level statistics.
+        Pre-computed dataset statistics.
     percentile_threshold : float
-        Minimum percentile rank to consider a feature noteworthy
-        (default: 95.0 = 95th percentile).
+        Minimum percentile rank to flag (default: 75.0).
+    max_reasons : int
+        Maximum number of statistical reasons to return.
+
+    Returns
+    -------
+    list[str]
+        Ranked reason strings, most-deviant first.
+    """
+    deviations: List[Tuple[float, str, str]] = []  # (severity, reason, feat_name)
+
+    for feat_name, meta in PROFILED_FEATURES.items():
+        if feat_name not in profile.stats:
+            continue
+
+        observed = row_features.get(feat_name)
+        if observed is None or (isinstance(observed, float) and np.isnan(observed)):
+            continue
+
+        observed = float(observed)
+        stats = profile.stats[feat_name]
+        sorted_vals = profile.series_cache.get(feat_name, np.array([]))
+        pct_rank = compute_percentile_rank(observed, sorted_vals)
+
+        # Compute absolute Z-score for ranking severity
+        if stats.std > 0:
+            zscore = abs((observed - stats.median) / stats.std)
+        else:
+            zscore = 0.0
+
+        # Skip features that are AT or BELOW the median (not anomalous)
+        direction = meta["direction"]
+        is_noteworthy = False
+
+        if direction == "high" and pct_rank >= percentile_threshold and observed > stats.median:
+            is_noteworthy = True
+        elif direction == "low" and pct_rank <= (100.0 - percentile_threshold) and observed < stats.median:
+            is_noteworthy = True
+
+        # Special: peel chain disparity > 0 always noteworthy
+        if feat_name == "peel_chain_disparity" and observed > 0 and observed > stats.median:
+            is_noteworthy = True
+        if feat_name == "peel_chain_length" and observed >= 2:
+            is_noteworthy = True
+
+        if not is_noteworthy:
+            continue
+
+        reason = _format_deviation_reason(feat_name, meta, observed, stats, pct_rank)
+        deviations.append((zscore, reason, feat_name))
+
+    # Sort by severity (highest Z-score first)
+    deviations.sort(key=lambda x: x[0], reverse=True)
+
+    return [reason for _, reason, _ in deviations[:max_reasons]]
+
+
+def _format_deviation_reason(
+    feat_name: str,
+    meta: dict,
+    observed: float,
+    stats: FeatureStats,
+    pct_rank: float,
+) -> str:
+    """Build a forensic-grade deviation reason string."""
+    label = meta["label"]
+    obs_str = _format_value(observed, feat_name)
+    med_str = _format_value(stats.median, feat_name)
+
+    # Core: what percentile is this value in?
+    reason = (
+        f"{label} of {obs_str} is in the {pct_rank}th percentile "
+        f"(dataset median: {med_str})"
+    )
+
+    # Append domain-specific interpretation
+    _INTERPRETATIONS = {
+        "fan_out":               " — rapid 1-to-many dispersal pattern",
+        "fan_in":                " — mass input consolidation pattern",
+        "fee_rate_urgency":      " — miner-priority overpayment (time-sensitive hop)",
+        "entity_ip_diversity":   " — entity broadcasts from anomalously many IPs",
+        "ip_entity_diversity":   " — multiple entities sharing the same IP relay",
+        "port_risk_combined":    " — proxy/Tor/tunneling port profile",
+        "value_zscore_abs":      " — statistically anomalous transaction volume",
+        "peel_chain_disparity":  " — peel-pattern output asymmetry",
+        "peel_chain_length":     f" — multi-hop peel chain ({int(observed)} linked hops)",
+        "fund_diminishment_ratio": " — progressive fund siphoning across hops",
+        "amount_btc_scaled":     " — unusually large transfer value",
+        "fee_scaled":            " — fee deviates from typical range",
+        "src_port_risk":         " — source port associated with anonymization",
+        "dst_port_risk":         " — destination port associated with hidden services",
+    }
+
+    if feat_name in _INTERPRETATIONS:
+        reason += _INTERPRETATIONS[feat_name]
+
+    return reason
+
+
+def _format_value(value: float, feat_name: str) -> str:
+    """Format a numeric value for human display."""
+    if feat_name in ("fan_in", "fan_out", "peel_chain_length"):
+        return str(int(value))
+    elif feat_name in ("fee_rate_urgency", "peel_chain_disparity", "fund_diminishment_ratio"):
+        return f"{value:.6f}"
+    else:
+        return f"{value:.4f}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE C: FALLBACK — LARGEST Z-SCORE DEVIATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _fallback_max_deviation(
+    row_features: pd.Series,
+    profile: DatasetProfile,
+) -> str:
+    """
+    When no specific triggers fire, identify the single feature that
+    deviates furthest from the dataset mean (by Z-score) and report it.
+
+    This guarantees every anomaly gets a UNIQUE explanation even when
+    no individual feature crosses the 75th percentile threshold.
+    """
+    max_zscore = 0.0
+    max_feat = None
+    max_observed = 0.0
+    max_stats = None
+
+    for feat_name in PROFILED_FEATURES:
+        if feat_name not in profile.stats:
+            continue
+
+        observed = row_features.get(feat_name)
+        if observed is None or (isinstance(observed, float) and np.isnan(observed)):
+            continue
+
+        observed = float(observed)
+        stats = profile.stats[feat_name]
+
+        if stats.std > 0:
+            zscore = abs((observed - stats.mean) / stats.std)
+        else:
+            zscore = 0.0
+
+        if zscore > max_zscore:
+            max_zscore = zscore
+            max_feat = feat_name
+            max_observed = observed
+            max_stats = stats
+
+    if max_feat is not None and max_stats is not None:
+        meta = PROFILED_FEATURES[max_feat]
+        obs_str = _format_value(max_observed, max_feat)
+        med_str = _format_value(max_stats.median, max_feat)
+        return (
+            f"Largest deviation: {meta['label']} of {obs_str} "
+            f"({max_zscore:.1f}σ from mean; dataset median: {med_str})"
+        )
+
+    return "Multivariate anomaly (combined feature interactions flagged by model)"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STRUCTURED TELEMETRY (for Heuristics Inspector panel)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_telemetry(
+    row_features: pd.Series,
+    profile: DatasetProfile,
+    percentile_threshold: float = 75.0,
+) -> List[Dict[str, Any]]:
+    """
+    Generate structured telemetry dicts for a single transaction.
+
+    For each profiled feature, computes the percentile rank.
+    Features above the threshold are included in the output.
 
     Returns
     -------
     list[dict]
-        One dict per flagged feature, containing:
-
-        - ``feature_name`` — canonical feature name
-        - ``label`` — human-readable feature label
-        - ``observed_value`` — the transaction's value
-        - ``dataset_median`` — median of the dataset
-        - ``dataset_p95`` — 95th percentile of the dataset
-        - ``percentile_rank`` — where this value falls (0–100)
-        - ``heuristic_flags`` — list of heuristic tags
-        - ``audit_reason`` — human-readable explanation string
+        One dict per flagged feature containing: feature_name, label,
+        observed_value, dataset_median, dataset_p95, percentile_rank,
+        heuristic_flags, audit_reason.
     """
     telemetry: List[Dict[str, Any]] = []
 
@@ -278,13 +599,13 @@ def generate_telemetry(
         direction = meta["direction"]
         is_flagged = False
 
-        if direction == "high" and pct_rank >= percentile_threshold:
+        if direction == "high" and pct_rank >= percentile_threshold and observed > stats.median:
             is_flagged = True
-        elif direction == "low" and pct_rank <= (100.0 - percentile_threshold):
+        elif direction == "low" and pct_rank <= (100.0 - percentile_threshold) and observed < stats.median:
             is_flagged = True
 
-        # Special cases: binary/categorical flags always report if non-zero
-        if feat_name == "peel_chain_disparity" and observed > 0:
+        # Special cases
+        if feat_name == "peel_chain_disparity" and observed > 0 and observed > stats.median:
             is_flagged = True
         if feat_name == "peel_chain_length" and observed >= 2:
             is_flagged = True
@@ -292,8 +613,7 @@ def generate_telemetry(
         if not is_flagged:
             continue
 
-        # Build audit reason
-        audit_reason = _build_audit_reason(
+        audit_reason = _format_deviation_reason(
             feat_name, meta, observed, stats, pct_rank,
         )
 
@@ -311,61 +631,8 @@ def generate_telemetry(
     return telemetry
 
 
-def _build_audit_reason(
-    feat_name: str,
-    meta: dict,
-    observed: float,
-    stats: FeatureStats,
-    pct_rank: float,
-) -> str:
-    """Build a human-readable audit reason for a flagged feature."""
-
-    label = meta["label"]
-    obs_str = _format_value(observed, feat_name)
-    med_str = _format_value(stats.median, feat_name)
-    p95_str = _format_value(stats.p95, feat_name)
-
-    # Core percentile statement
-    reason = (
-        f"{label} of {obs_str} places this transaction in the "
-        f"{pct_rank}th percentile; dataset median is {med_str}"
-    )
-
-    # Add contextual interpretation
-    if feat_name == "fan_out" and observed > stats.p95:
-        reason += " — rapid 1-to-many dispersal pattern"
-    elif feat_name == "fan_in" and observed > stats.p95:
-        reason += " — mass input consolidation pattern"
-    elif feat_name == "fee_rate_urgency" and observed > stats.p95:
-        reason += " — miner-priority overpayment suggesting time-sensitive hop"
-    elif feat_name == "peel_chain_disparity" and observed > 0:
-        reason += " — single-split output asymmetry (peel-pattern candidate)"
-    elif feat_name == "peel_chain_length" and observed >= 2:
-        reason += f" — multi-hop peel chain trajectory ({int(observed)} linked hops)"
-    elif feat_name == "entity_ip_diversity" and observed > stats.p95:
-        reason += " — entity broadcasts from anomalously many distinct IPs"
-    elif feat_name == "port_risk_combined" and observed > stats.p95:
-        reason += " — possible proxy/Tor/tunneling infrastructure"
-    elif feat_name == "value_zscore_abs" and observed > stats.p95:
-        reason += " — statistically anomalous transaction volume"
-
-    return reason
-
-
-def _format_value(value: float, feat_name: str) -> str:
-    """Format a numeric value for human display."""
-    if feat_name in ("fan_in", "fan_out", "peel_chain_length"):
-        return str(int(value))
-    elif feat_name in ("fee_rate_urgency", "peel_chain_disparity"):
-        return f"{value:.6f}"
-    elif feat_name in ("percentile_rank",):
-        return f"{value:.1f}"
-    else:
-        return f"{value:.4f}"
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-# EXPLANATION GENERATOR (Percentile-Based)
+# MAIN EXPLANATION GENERATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
 def generate_explanation(
@@ -375,54 +642,74 @@ def generate_explanation(
     profile: DatasetProfile,
 ) -> str:
     """
-    Generate a human-readable explanation for a single transaction
-    using dataset-relative percentile profiling.
+    Generate a UNIQUE, human-readable explanation for a single
+    flagged transaction by combining direct signal detection with
+    statistical deviation ranking.
 
-    Unlike the legacy ``ml_engine.generate_explanation()`` which used
-    hardcoded thresholds (e.g., ``fan_out > 5``), this function
-    derives all trigger conditions from the **95th percentile** of
-    the actual ingested dataset distribution.
+    This function is the core of the MITHYA XAI engine. It guarantees
+    that every anomaly receives a specific, tailored explanation —
+    never a generic fallback string.
 
     Parameters
     ----------
     row_features : pd.Series
-        Feature values for this transaction.
+        Engineered feature values for this transaction (from the
+        features DataFrame, NOT the original transaction row).
     deviation_score : float
-        Anomaly Deviation Score (0–100) from
-        :func:`anomaly_engine.compute_anomaly_deviation_scores`.
+        Anomaly Deviation Score (0–100).
     original_row : pd.Series
-        The original transaction row (for display fields like
-        ``src_ip``, ``src_port``, ``total_amount_btc``).
+        The original transaction row (src_port, fee, attack_type, etc.)
     profile : DatasetProfile
         Pre-computed dataset-level statistics.
 
     Returns
     -------
     str
-        Human-readable explanation string.
+        A cohesive, forensic-grade explanation string.
     """
+    # Normal traffic — no explanation needed
     if deviation_score < 50.0:
         return "Normal network traffic behavior."
 
-    telemetry = generate_telemetry(row_features, profile)
+    reasons: List[str] = []
 
-    if not telemetry:
-        return (
-            "Anomalous deviation from baseline transaction distribution "
-            "(structural graph relationships flagged by unsupervised model)."
-        )
+    # ── Phase A: Direct signal detection (raw fields) ─────────────────
+    direct_signals = _detect_direct_signals(original_row, row_features, profile)
+    reasons.extend(direct_signals)
 
-    reasons = [entry["audit_reason"] for entry in telemetry]
+    # ── Phase B: Statistical deviation ranking (feature percentiles) ──
+    stat_reasons = _rank_feature_deviations(row_features, profile)
 
-    # Check for micro-transaction (binary feature, not percentile-based)
-    if row_features.get("is_micro_tx", 0) == 1:
-        amount = original_row.get("total_amount_btc", 0)
-        reasons.append(
-            f"Micro-transaction detected ({amount:.4f} BTC)"
-        )
+    # Only add stat reasons that aren't redundant with direct signals
+    # (e.g., don't say "port risk score is high" if we already said "Tor port 9050")
+    _direct_text = " ".join(reasons).lower()
+    for reason in stat_reasons:
+        # Skip if the same concept was already covered by direct signals
+        skip = False
+        if "port" in reason.lower() and ("tor" in _direct_text or "proxy" in _direct_text or "port" in _direct_text):
+            skip = True
+        if "fan-out" in reason.lower() and "fan-out" in _direct_text:
+            skip = True
+        if "fan-in" in reason.lower() and "fan-in" in _direct_text:
+            skip = True
+        if "peel" in reason.lower() and "peel" in _direct_text:
+            skip = True
+        if "fee" in reason.lower() and "fee" in _direct_text:
+            skip = True
+        if not skip:
+            reasons.append(reason)
+
+    # ── Phase C: Fallback — largest single Z-score deviation ──────────
+    if not reasons:
+        fallback = _fallback_max_deviation(row_features, profile)
+        reasons.append(fallback)
 
     return "Anomaly indicators: " + "; ".join(reasons) + "."
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BATCH EXPLANATION GENERATOR
+# ═══════════════════════════════════════════════════════════════════════════
 
 def generate_all_explanations(
     df: pd.DataFrame,

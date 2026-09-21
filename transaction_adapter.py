@@ -42,8 +42,7 @@ Supported Formats
   columns for addresses and amounts.
 - **JSON** (.json):  Array of transaction objects *or* a top-level dictionary
   whose values are transaction objects (keyed by txid).
-- **XML** (.xml):  Hierarchical ``<transactions><transaction>…</transaction>
-  …</transactions>`` structure parsed via ``xml.etree.ElementTree``.
+- **XML** (.xml):  Hierarchical ``<transactions><transaction>...</transaction>...</transactions>`` structure parsed via ``defusedxml.ElementTree`` (XXE-safe).
 
 Canonical DataFrame Schema
 --------------------------
@@ -82,7 +81,21 @@ import json
 import logging
 import mimetypes
 import os
-import xml.etree.ElementTree as ET
+# defusedxml replaces stdlib xml.etree.ElementTree to prevent XXE / entity-
+# expansion attacks (billion laughs, external entity injection, etc.).
+# Reference: https://pypi.org/project/defusedxml/
+try:
+    import defusedxml.ElementTree as ET
+except ImportError as _defusedxml_err:
+    import warnings as _warnings_mod
+    _warnings_mod.warn(
+        "[SECURITY] defusedxml is not installed. Falling back to stdlib "
+        "xml.etree.ElementTree which is VULNERABLE to XXE attacks. "
+        "Install with: pip install defusedxml",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    import xml.etree.ElementTree as ET  # noqa: F401  # fallback (unsafe)
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -365,8 +378,12 @@ class BaseTransactionAdapter(ABC):
             features, contamination=contamination,
         )
         risk_scores = ml_engine.compute_risk_scores(raw_scores)
+        dataset_profile = ml_engine._build_dataset_profile(features)
+        ml_engine._log(
+            f"[*] Built dataset profile: {len(dataset_profile.stats)} features profiled"
+        )
         enriched_df = ml_engine.generate_all_explanations(
-            df, features, predictions, risk_scores,
+            df, features, predictions, risk_scores, dataset_profile,
         )
 
         # 9. Institutional whitelist
@@ -794,8 +811,10 @@ class BitcoinXMLAdapter(BaseTransactionAdapter):
     """
     Concrete adapter for Bitcoin transaction data in XML format.
 
-    Uses Python's native :mod:`xml.etree.ElementTree` to parse
-    hierarchical transaction nodes.
+    Uses :mod:`defusedxml.ElementTree` (XXE-safe XML parser) to parse
+    hierarchical transaction nodes.  This prevents XML External Entity
+    (XXE) injection, billion-laughs, and DTD-based denial-of-service
+    attacks that are possible with the stdlib ``xml.etree.ElementTree``.
 
     Expected XML structure::
 

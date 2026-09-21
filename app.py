@@ -45,6 +45,13 @@ class AirGapSocket(_original_socket):
         return super().connect(address)
 socket.socket = AirGapSocket
 
+# Offline Geo-ASN enrichment (Phase 4)
+try:
+    from geo_asn import enrich_dataframe as _geo_enrich_df
+    _HAS_GEO_ASN = True
+except ImportError:
+    _HAS_GEO_ASN = False
+
 # Import the AI engine and cross-chain adapter layer
 from ml_engine import (
     run_pipeline_from_df,
@@ -346,6 +353,8 @@ REQUIRED_COLUMNS = [
     "txid", "input_addresses", "output_addresses",
     "input_amounts", "output_amounts", "fee", "script_type", "geo_country",
 ]
+# ASN is enriched offline after pipeline run (Phase 4)
+ASN_COLUMN = "asn"
 
 # Path to the Python interpreter in our venv
 PYTHON_BIN = os.path.join(os.path.dirname(__file__), ".venv", "bin", "python3")
@@ -504,10 +513,15 @@ if uploaded_whitelist is not None:
 
 
 def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
-    """Run the full AI pipeline via the polymorphic adapter."""
+    """Run the full AI pipeline via the polymorphic adapter, then enrich with offline Geo-ASN."""
     enriched_df, _model, features = adapter.run_pipeline_from_df(
         raw_df, contamination=cont,
     )
+    # Phase 4: offline ASN enrichment (no network I/O)
+    if _HAS_GEO_ASN and "src_ip" in enriched_df.columns:
+        enriched_df = _geo_enrich_df(enriched_df, ip_col="src_ip", inplace=False)
+    elif "asn" not in enriched_df.columns:
+        enriched_df["asn"] = "AS0"
     return enriched_df, features
 
 
@@ -832,7 +846,7 @@ with tab2:
     display_cols = [
         "txid", "risk_score", "entity_id", "explanation",
         "src_port", "dst_port", "total_amount_btc", "fee",
-        "script_type", "geo_country",
+        "script_type", "geo_country", "asn",
     ]
     if "attack_type" in view_df.columns:
         display_cols.insert(3, "attack_type")
@@ -849,7 +863,7 @@ with tab2:
     # Rename columns for display
     rename_map = {
         "txid": "TX ID",
-        "risk_score": "Risk %",
+        "risk_score": "Investigative Priority %",
         "entity_id": "Entity",
         "attack_type": "Attack Type",
         "explanation": "XAI Explanation",
@@ -859,16 +873,33 @@ with tab2:
         "fee": "Fee",
         "script_type": "Script",
         "geo_country": "Propagation Node",
+        "asn": "ASN",
     }
     display_df.rename(columns=rename_map, inplace=True)
 
     # ── Render ──
+    # Phase 3 disclaimer: network telemetry is NOT absolute identity attribution
+    st.markdown(
+        """
+        <div style="background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.3);
+                    border-radius: 0.6rem; padding: 0.7rem 1rem; margin-bottom: 0.8rem;">
+            <span style="color: #fbbf24; font-size: 0.78rem; font-weight: 600;">
+                &#9888;&#65039; Network observation correlation &mdash; not absolute identity attribution
+                (Subject to VPN / NAT / Tor limits).
+                ASN and geo-country are resolved offline via the mock GeoLite2 database.
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.markdown('<div class="investigation-panel">', unsafe_allow_html=True)
 
+    prio_col = "Investigative Priority %" if "Investigative Priority %" in display_df.columns else "Risk %"
     st.dataframe(
         display_df.style.background_gradient(
-            subset=["Risk %"], cmap="YlOrRd", vmin=0, vmax=100
-        ).format({"Amount (BTC)": "{:.6f}", "Risk %": "{:.1f}", "Fee": "{:.8f}"}),
+            subset=[prio_col], cmap="YlOrRd", vmin=0, vmax=100
+        ).format({"Amount (BTC)": "{:.6f}", prio_col: "{:.1f}", "Fee": "{:.8f}"}),
         use_container_width=True,
         height=520,
         hide_index=True,
@@ -1062,17 +1093,37 @@ with tab3:
 
             # ─── Entity node ───
             if entity not in added_nodes:
+                # Phase 3: cluster confidence labels (not all common-inputs are
+                # absolute facts — label based on evidence strength)
+                is_mixer_ent = "CoinJoin" in str(row.get("attack_type", ""))
                 if is_regulated:
                     ent_color, ent_size = "#10b981", 28  # Emerald Green
                     ent_title = f"✅ REGULATED ENTITY: {entity}"
+                    cluster_label = "Whitelisted cluster"
                     display_label = f"{entity} 🛡️"
+                elif is_mixer_ent:
+                    ent_color, ent_size = "#a78bfa", 26
+                    ent_title = (
+                        f"⚠️ MIXER-AFFECTED ENTITY: {entity}\n"
+                        f"Cluster Confidence: LOWER (CoinJoin may merge unrelated wallets)"
+                    )
+                    cluster_label = "Mixer-affected cluster"
+                    display_label = entity
                 elif is_anom or entity in anom_entities:
                     ent_color, ent_size = "#dc2626", 30  # Crimson
-                    ent_title = f"⚠️ HIGH-RISK ENTITY: {entity}"
+                    ent_title = (
+                        f"⚠️ HIGH-RISK ENTITY: {entity}\n"
+                        f"Cluster Confidence: HIGH (multi-hop peel chain linkage)"
+                    )
+                    cluster_label = "High-confidence cluster"
                     display_label = entity
                 else:
                     ent_color, ent_size = "#9b59b6", 22
-                    ent_title = f"Entity Cluster: {entity}"
+                    ent_title = (
+                        f"Entity Cluster: {entity}\n"
+                        f"Cluster Confidence: HEURISTIC (common-input-ownership)"
+                    )
+                    cluster_label = "Heuristic cluster"
                     display_label = entity
                 temp_nx.add_node(
                     entity, label=display_label, color=ent_color, size=ent_size, shape="square",
@@ -1127,10 +1178,25 @@ with tab4:
         unsafe_allow_html=True,
     )
 
+    # Phase 3: network telemetry disclaimer (persistent, visible)
+    st.markdown(
+        """
+        <div style="background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.3);
+                    border-radius: 0.6rem; padding: 0.7rem 1rem; margin-bottom: 0.8rem;">
+            <span style="color: #fbbf24; font-size: 0.78rem; font-weight: 600;">
+                &#9888;&#65039; Network observation correlation &mdash; not absolute identity attribution
+                (Subject to VPN / NAT / Tor limits). IP telemetry identifies observation nodes,
+                NOT sender identities. ASN data resolved offline (no external API).
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # ── Transaction selector ──
     sorted_df = df.sort_values("risk_score", ascending=False)
     tx_options = [
-        f"{row['txid'][:12]}… | Priority: {row['risk_score']:.1f}% | {row.get('attack_type', 'N/A')}"
+        f"{row['txid'][:12]}... | Anomaly Score: {row['risk_score']:.1f}% | {row.get('attack_type', 'N/A')}"
         for _, row in sorted_df.iterrows()
     ]
     txid_map = {opt: row["txid"] for opt, (_, row) in zip(tx_options, sorted_df.iterrows())}
@@ -1182,6 +1248,7 @@ with tab4:
                     <div style="display: flex; gap: 0.5rem; align-items: center;">
                         {risk_badge}
                         <span class="badge {attack_badge_cls}">{attack_type}</span>
+                        <span style="color: #9ca3af; font-size: 0.72rem; margin-right: 4px;">Anomaly Score:</span>
                         <span style="color: #e5e7eb; font-size: 1.4rem; font-weight: 800;">{risk_val:.1f}%</span>
                     </div>
                 </div>
@@ -1192,7 +1259,7 @@ with tab4:
                     </div>
                     <div>
                         <div style="color: #9ca3af; font-size: 0.68rem; text-transform: uppercase;">Ports</div>
-                        <div style="color: #e5e7eb;">{tx_row['src_port']} → {tx_row['dst_port']}</div>
+                        <div style="color: #e5e7eb;">{tx_row['src_port']} &rarr; {tx_row['dst_port']}</div>
                     </div>
                     <div>
                         <div style="color: #9ca3af; font-size: 0.68rem; text-transform: uppercase;">Amount</div>
@@ -1201,6 +1268,17 @@ with tab4:
                     <div>
                         <div style="color: #9ca3af; font-size: 0.68rem; text-transform: uppercase;">Entity</div>
                         <div style="color: #e5e7eb;">{tx_row.get('entity_id', 'N/A')}</div>
+                    </div>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; font-size: 0.82rem; margin-top: 0.8rem;
+                            background: rgba(245,158,11,0.05); border: 1px solid rgba(245,158,11,0.15); border-radius: 0.5rem; padding: 0.6rem 1rem;">
+                    <div>
+                        <div style="color: #9ca3af; font-size: 0.68rem; text-transform: uppercase;">Geo (Offline ASN)</div>
+                        <div style="color: #fbbf24;">{tx_row.get('geo_country', 'N/A')} &nbsp;&middot;&nbsp; {tx_row.get('asn', 'N/A')}</div>
+                    </div>
+                    <div>
+                        <div style="color: #9ca3af; font-size: 0.68rem; text-transform: uppercase;">Attribution Caveat</div>
+                        <div style="color: #f59e0b; font-size: 0.72rem;">&#9888; Subject to VPN/NAT/Tor limits</div>
                     </div>
                 </div>
             </div>
@@ -1307,9 +1385,16 @@ with tab4:
         st.markdown(
             f"""
             <div style="text-align: center; color: #6b7280; font-size: 0.78rem; margin-top: 0.5rem;">
-                Fee: <b style="color: #fbbf24;">{tx_row['fee']:.8f} BTC</b> &nbsp;·&nbsp;
-                Script: <b style="color: #a5b4fc;">{tx_row['script_type']}</b> &nbsp;·&nbsp;
+                Fee: <b style="color: #fbbf24;">{tx_row['fee']:.8f} BTC</b> &nbsp;&middot;&nbsp;
+                Script: <b style="color: #a5b4fc;">{tx_row['script_type']}</b> &nbsp;&middot;&nbsp;
                 First-Seen Node: <b style="color: #60a5fa;">{tx_row.get('geo_country', 'N/A')}</b>
+                &nbsp;&middot;&nbsp;
+                ASN: <b style="color: #34d399;">{tx_row.get('asn', 'N/A')}</b>
+            </div>
+            <div style="text-align: center; color: #92400e; font-size: 0.70rem; margin-top: 0.3rem;
+                        background: rgba(245,158,11,0.06); border-radius: 0.4rem; padding: 0.3rem;">
+                &#9888; Network observation correlation &mdash; not absolute identity attribution
+                (Subject to VPN / NAT / Tor limits)
             </div>
             """,
             unsafe_allow_html=True,
