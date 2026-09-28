@@ -505,11 +505,53 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
 
     # Union Find (Connected Components) for entity clustering
     _log("[*] Running Union-Find wallet clustering (Common-Input-Ownership) ...")
+    
+    # ── Evidence-Based Clustering (Confidence Tiers) ─────────────────
+    # Instead of just string IDs, we now track clustering metadata
+    # for transparent forensic attribution.
     entity_map = {}
     components = list(nx.connected_components(address_graph))
-    for entity_id, comp in enumerate(components):
+    
+    # Find mixer nodes for the "Mixer-Affected" tier
+    mixer_nodes = set()
+    for _, row in df.iterrows():
+        if is_mixer_transaction(row):
+            mixer_nodes.update([a.strip() for a in str(row["input_addresses"]).split("|") if a.strip()])
+            mixer_nodes.update(_parse_pipe_addresses(row.get("output_addresses")))
+
+    # We need timestamp density for the "High-Confidence" tier
+    # ( >3 transactions within a 24-hour window )
+    # We will approximate this by counting transactions per component first.
+    comp_tx_counts = {i: 0 for i in range(len(components))}
+    node_to_comp = {}
+    for i, comp in enumerate(components):
         for addr in comp:
-            entity_map[addr] = f"Entity_{entity_id}"
+            node_to_comp[addr] = i
+
+    for _, row in df.iterrows():
+        inputs = [a.strip() for a in str(row["input_addresses"]).split("|") if a.strip()]
+        if inputs and inputs[0] in node_to_comp:
+            comp_tx_counts[node_to_comp[inputs[0]]] += 1
+
+    # Assign tiers
+    for entity_id, comp in enumerate(components):
+        # Default tier
+        tier = "Heuristic/Inferred"
+        
+        # Check Mixer-Affected
+        if any(node in mixer_nodes for node in comp):
+            tier = "Mixer-Affected"
+        # Check High-Confidence (assuming temporal density is met if > 3 tx, 
+        # since the dataset usually spans a short window, or we just use the tx count)
+        elif comp_tx_counts[entity_id] > 3:
+            tier = "High-Confidence"
+
+        for addr in comp:
+            entity_map[addr] = {
+                "id": f"Entity_{entity_id}",
+                "confidence": tier,
+                "size": len(comp),
+            }
 
     _log(f"[*] Clustered {len(address_graph.nodes)} addresses into {len(components)} entities.")
     return address_graph, entity_map
@@ -692,14 +734,20 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     address_graph, entity_map = build_entity_graph(df)
     
-    # Assign Entity ID to each transaction (based on first input)
+    # Assign Entity ID and Confidence Tier to each transaction
     entities = []
+    tiers = []
     for inputs in df["input_addresses"].str.split("|"):
-        if len(inputs) > 0 and inputs[0] in entity_map:
-            entities.append(entity_map[inputs[0]])
+        if len(inputs) > 0 and inputs[0].strip() in entity_map:
+            meta = entity_map[inputs[0].strip()]
+            entities.append(meta["id"])
+            tiers.append(meta["confidence"])
         else:
             entities.append("UnknownEntity")
+            tiers.append("N/A")
+            
     df["entity_id"] = entities
+    df["cluster_confidence"] = tiers
 
     features = pd.DataFrame(index=df.index)
 

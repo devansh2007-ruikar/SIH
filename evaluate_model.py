@@ -144,15 +144,21 @@ def generate_benign_traffic(n: int = 300) -> pd.DataFrame:
     """
     Simulate institutional / exchange-level normal transactions.
 
-    Characteristics:
-    - 1-3 inputs, 1-2 outputs
-    - Moderate, round-ish amounts (exchange settlements)
-    - Standard ports (8333, 443)
-    - Low fee rate (sub-satoshi urgency)
-    - Geo-diverse but ASN-coherent (major cloud ASNs)
+    Includes **hard negatives** that stress-test false positive rates:
+    - Verified exchange settlements (high-volume, round amounts)
+    - Mining pool payouts (1-input, 50+ outputs, equal-ish amounts)
+    - Multi-sig treasury consolidations (many inputs, 1 output)
+
+    These look structurally similar to threats but are legitimate.
     """
     records = []
-    for _ in range(n):
+    n_standard     = int(n * 0.50)
+    n_exchange     = int(n * 0.20)
+    n_mining_pool  = int(n * 0.15)
+    n_treasury     = n - n_standard - n_exchange - n_mining_pool
+
+    # ── Standard retail transactions ────────────────────────────────
+    for _ in range(n_standard):
         n_in  = int(_rng.integers(1, 4))
         n_out = int(_rng.integers(1, 3))
         in_addrs  = [_btc_addr("bc1q") for _ in range(n_in)]
@@ -178,6 +184,73 @@ def generate_benign_traffic(n: int = 300) -> pd.DataFrame:
             "asn":              f"AS{int(_rng.integers(1000, 65000))}",
             "_label":           0,  # BENIGN
         })
+
+    # ── Hard negative: Exchange settlements (high value, round) ─────
+    for _ in range(n_exchange):
+        total = round(float(_rng.choice([10, 25, 50, 100, 250])), 2)
+        n_out = int(_rng.integers(1, 3))
+        records.append({
+            "timestamp":        _ts(),
+            "txid":             fake.sha256(),
+            "src_ip":           _src_ip(),
+            "dst_ip":           _src_ip(),
+            "src_port":         443,
+            "dst_port":         8333,
+            "input_addresses":  _pipe([_btc_addr("bc1q") for _ in range(int(_rng.integers(2, 5)))]),
+            "output_addresses": _pipe([_btc_addr("bc1q") for _ in range(n_out)]),
+            "input_amounts":    str(total),
+            "output_amounts":   _pipe([round(total * 0.99 / n_out, 8)] * n_out),
+            "fee":              round(total * 0.0005, 8),
+            "script_type":      "P2WPKH",
+            "geo_country":      _rng.choice(["US", "SG", "JP", "DE"]),
+            "asn":              f"AS{int(_rng.choice([16509, 13335, 15169]))}",
+            "_label":           0,
+        })
+
+    # ── Hard negative: Mining pool payouts (1-in, many-out, ~equal) ─
+    for _ in range(n_mining_pool):
+        n_out = int(_rng.integers(20, 60))
+        payout = round(float(_rng.uniform(0.001, 0.01)), 6)
+        records.append({
+            "timestamp":        _ts(),
+            "txid":             fake.sha256(),
+            "src_ip":           _src_ip(),
+            "dst_ip":           _src_ip(),
+            "src_port":         8333,
+            "dst_port":         8333,
+            "input_addresses":  _btc_addr("bc1q"),
+            "output_addresses": _pipe([_btc_addr("bc1q") for _ in range(n_out)]),
+            "input_amounts":    str(round(payout * n_out * 1.01, 8)),
+            "output_amounts":   _pipe([round(payout * float(_rng.uniform(0.95, 1.05)), 8) for _ in range(n_out)]),
+            "fee":              round(0.00005 * n_out, 8),
+            "script_type":      "P2WPKH",
+            "geo_country":      _rng.choice(["US", "CN", "IS", "KZ"]),
+            "asn":              f"AS{int(_rng.integers(1000, 65000))}",
+            "_label":           0,
+        })
+
+    # ── Hard negative: Multi-sig treasury consolidation ─────────────
+    for _ in range(n_treasury):
+        n_in = int(_rng.integers(10, 30))
+        total = round(float(_rng.uniform(5.0, 50.0)), 6)
+        records.append({
+            "timestamp":        _ts(),
+            "txid":             fake.sha256(),
+            "src_ip":           _src_ip(),
+            "dst_ip":           _src_ip(),
+            "src_port":         443,
+            "dst_port":         8333,
+            "input_addresses":  _pipe([_btc_addr("3") for _ in range(n_in)]),
+            "output_addresses": _btc_addr("bc1q"),
+            "input_amounts":    _pipe([round(total / n_in, 8)] * n_in),
+            "output_amounts":   str(round(total * 0.999, 8)),
+            "fee":              round(total * 0.001, 8),
+            "script_type":      "P2SH",
+            "geo_country":      _rng.choice(["US", "CH", "SG"]),
+            "asn":              f"AS{int(_rng.choice([16509, 8075, 13335]))}",
+            "_label":           0,
+        })
+
     return pd.DataFrame(records)
 
 
@@ -681,6 +754,139 @@ def print_report(results: List[Dict], verbose: bool = False) -> None:
 
 
 # ============================================================================
+# RULES-ONLY BASELINE CLASSIFIER
+# ============================================================================
+
+_TOR_I2P_PORTS = {9050, 9051, 9150, 4444}
+
+
+def _rules_only_predict(df: pd.DataFrame) -> np.ndarray:
+    """
+    Simple rules-only baseline: flags a transaction as suspicious (1) if
+    ANY of these conditions are met:
+    - src_port is a known Tor/I2P port
+    - fee-to-amount ratio > 10%
+    - fan-out > 20 unique output addresses
+    - equal-output ratio > 50% with 10+ outputs (mixer signature)
+
+    This provides a deterministic comparison against the ML model's
+    learned decision boundary.
+    """
+    preds = np.zeros(len(df), dtype=int)
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        # Rule 1: Tor/I2P port
+        try:
+            if int(row.get("src_port", 0)) in _TOR_I2P_PORTS:
+                preds[i] = 1
+                continue
+        except (ValueError, TypeError):
+            pass
+
+        # Rule 2: fee-to-amount ratio
+        try:
+            total = _sum_pipe(row.get("input_amounts"))
+            fee = float(row.get("fee", 0))
+            if total > 0 and fee / total > 0.10:
+                preds[i] = 1
+                continue
+        except (ValueError, TypeError):
+            pass
+
+        # Rule 3: fan-out > 20
+        n_out = _count_pipe(row.get("output_addresses"))
+        if n_out > 20:
+            preds[i] = 1
+            continue
+
+        # Rule 4: equal-output mixer signature
+        try:
+            out_vals = []
+            for t in str(row.get("output_amounts", "")).split("|"):
+                try:
+                    out_vals.append(float(t.strip()))
+                except ValueError:
+                    pass
+            if len(out_vals) >= 10:
+                mode_val = max(
+                    set(round(v, 4) for v in out_vals),
+                    key=lambda v: sum(1 for x in out_vals if abs(x - v) / max(abs(v), 1e-9) < 0.01),
+                )
+                eq_count = sum(1 for x in out_vals if abs(x - mode_val) / max(abs(mode_val), 1e-9) < 0.01)
+                if eq_count / len(out_vals) >= 0.50:
+                    preds[i] = 1
+                    continue
+        except Exception:
+            pass
+
+    return preds
+
+
+def _evaluate_baseline(
+    name: str, df: pd.DataFrame, true_labels: np.ndarray,
+) -> Dict:
+    """Evaluate the rules-only baseline on a dataset."""
+    pred_labels = _rules_only_predict(df)
+    n_pos = int(true_labels.sum())
+    n_neg = len(true_labels) - n_pos
+
+    if n_pos == 0 or n_neg == 0:
+        prec = rec = f1 = fpr = float("nan")
+    else:
+        prec = precision_score(true_labels, pred_labels, zero_division=0)
+        rec  = recall_score(true_labels, pred_labels, zero_division=0)
+        f1   = f1_score(true_labels, pred_labels, zero_division=0)
+        tn, fp, fn, tp = confusion_matrix(
+            true_labels, pred_labels, labels=[0, 1],
+        ).ravel()
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+    return {
+        "dataset":   name,
+        "precision": prec,
+        "recall":    rec,
+        "f1_score":  f1,
+        "fpr":       fpr,
+    }
+
+
+# ============================================================================
+# HARDWARE TELEMETRY
+# ============================================================================
+
+def _get_hardware_info() -> Dict[str, str]:
+    """Collect hardware telemetry for the evaluation report."""
+    import platform
+    info = {
+        "platform":    platform.platform(),
+        "python":      platform.python_version(),
+        "cpu":         platform.processor() or "Unknown",
+        "arch":        platform.machine(),
+    }
+
+    # RAM
+    try:
+        import shutil
+        total_gb = shutil.disk_usage("/").total  # disk, not RAM — use /proc
+    except Exception:
+        pass
+
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    info["ram_gb"] = f"{kb / (1024**2):.1f} GB"
+                    info["ram_ok"] = "✅" if kb >= 16 * 1024 * 1024 else "⚠️ < 16GB"
+                    break
+    except FileNotFoundError:
+        info["ram_gb"] = "Unknown"
+        info["ram_ok"] = "N/A"
+
+    return info
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -689,37 +895,77 @@ def main(args: argparse.Namespace) -> None:
     contamination = args.contamination
     verbose       = args.verbose
 
+    hw = _get_hardware_info()
+    print(_c(f"\n[*] Platform: {hw['platform']}  |  Python {hw['python']}", _GREY))
+    print(_c(f"[*] CPU: {hw['cpu']} ({hw['arch']})  |  RAM: {hw.get('ram_gb', '?')} {hw.get('ram_ok', '')}", _GREY))
+
     print(_c(f"\n[*] Generating evaluation datasets (n={n} each)...", _BLUE))
 
     benign_df = generate_benign_traffic(n)
     known_df  = generate_known_threats(n)
     novel_df  = generate_novel_threats(n)
 
+    # ── Strict Train / Validation / Test split (60 / 20 / 20) ────────
+    print(_c("[*] Splitting data: Train (60%) / Validation (20%) / Test (20%)...", _BLUE))
+
+    def _split_df(df_in: pd.DataFrame, train_frac=0.6, val_frac=0.2):
+        """Deterministic 60/20/20 split."""
+        n_total = len(df_in)
+        n_train = int(n_total * train_frac)
+        n_val   = int(n_total * val_frac)
+        return (
+            df_in.iloc[:n_train].reset_index(drop=True),
+            df_in.iloc[n_train:n_train + n_val].reset_index(drop=True),
+            df_in.iloc[n_train + n_val:].reset_index(drop=True),
+        )
+
+    benign_train, benign_val, benign_test = _split_df(benign_df)
+    known_train,  known_val,  known_test  = _split_df(known_df)
+    _,            _,          novel_test  = _split_df(novel_df)
+
+    # ── Build features ───────────────────────────────────────────────
     print(_c("[*] Building feature matrices...", _BLUE))
 
-    X_benign = build_features(benign_df)
-    X_known  = build_features(known_df)
-    X_novel  = build_features(novel_df)
+    X_benign_train = build_features(benign_train)
+    X_known_train  = build_features(known_train)
+    X_benign_val   = build_features(benign_val)
+    X_known_val    = build_features(known_val)
+    X_benign_test  = build_features(benign_test)
+    X_known_test   = build_features(known_test)
+    X_novel_test   = build_features(novel_df)
 
-    # Training corpus: benign + known threats (novel threats are holdout)
-    X_train_raw = pd.concat([X_benign, X_known], ignore_index=True)
+    # Training corpus: benign_train + known_train
+    X_train = pd.concat([X_benign_train, X_known_train], ignore_index=True)
 
-    # Align feature columns across all matrices
-    all_cols = sorted(set(X_train_raw.columns) | set(X_novel.columns))
-    for xdf in [X_train_raw, X_benign, X_known, X_novel]:
+    # Align columns
+    all_cols = sorted(
+        set(X_train.columns)
+        | set(X_benign_val.columns)
+        | set(X_novel_test.columns)
+    )
+    for xdf in [X_train, X_benign_val, X_known_val,
+                X_benign_test, X_known_test, X_novel_test]:
         for col in all_cols:
             if col not in xdf.columns:
                 xdf[col] = 0.0
 
-    X_train_raw = X_train_raw[all_cols].fillna(0.0)
-    X_benign    = X_benign[all_cols].fillna(0.0)
-    X_known     = X_known[all_cols].fillna(0.0)
-    X_novel     = X_novel[all_cols].fillna(0.0)
+    X_train       = X_train[all_cols].fillna(0.0)
+    X_benign_val  = X_benign_val[all_cols].fillna(0.0)
+    X_known_val   = X_known_val[all_cols].fillna(0.0)
+    X_benign_test = X_benign_test[all_cols].fillna(0.0)
+    X_known_test  = X_known_test[all_cols].fillna(0.0)
+    X_novel_test  = X_novel_test[all_cols].fillna(0.0)
 
     print(_c(
         f"[*] Training IsolationForest "
         f"(n_estimators=200, contamination={contamination})...",
         _BLUE,
+    ))
+    print(_c(
+        f"    Train: {len(X_train)} rows  |  "
+        f"Val: {len(benign_val) + len(known_val)} rows  |  "
+        f"Test: {len(benign_test) + len(known_test) + len(novel_df)} rows",
+        _GREY,
     ))
 
     evaluator = ModelEvaluator(
@@ -727,21 +973,31 @@ def main(args: argparse.Namespace) -> None:
         contamination=contamination,
         verbose=verbose,
     )
-    evaluator.fit(X_train_raw)
+    evaluator.fit(X_train)
 
-    print(_c("[*] Evaluating on 3 dataset categories...", _BLUE))
+    # ── Evaluate on Validation set ───────────────────────────────────
+    print(_c("[*] Evaluating on Validation set...", _BLUE))
+    val_df = pd.concat([benign_val, known_val], ignore_index=True)
+    val_labels = val_df["_label"].values
+
+    val_result = evaluator.evaluate_dataset(
+        "VALIDATION  (benign_val + known_val)",
+        val_df, val_labels,
+    )
+
+    # ── Evaluate on 3 Test datasets ──────────────────────────────────
+    print(_c("[*] Evaluating on 3 Test dataset categories...", _BLUE))
 
     results = []
-
     results.append(evaluator.evaluate_dataset(
-        "benign_traffic  (exchanges / high-volume normal users)",
-        benign_df,
-        benign_df["_label"].values,
+        "benign_traffic  (exchanges / mining pools / treasury — hard negatives)",
+        benign_test,
+        benign_test["_label"].values,
     ))
     results.append(evaluator.evaluate_dataset(
         "known_threats   (peel chains / mixers / fee spikes)",
-        known_df,
-        known_df["_label"].values,
+        known_test,
+        known_test["_label"].values,
     ))
     results.append(evaluator.evaluate_dataset(
         "novel_threats   (dust dispersal / I2P sweep / consolidate-split)",
@@ -749,7 +1005,72 @@ def main(args: argparse.Namespace) -> None:
         novel_df["_label"].values,
     ))
 
+    # ── Rules-only baseline ──────────────────────────────────────────
+    print(_c("[*] Computing rules-only baseline for comparison...", _BLUE))
+    baseline_results = []
+    baseline_results.append(_evaluate_baseline(
+        "benign_traffic", benign_test, benign_test["_label"].values,
+    ))
+    baseline_results.append(_evaluate_baseline(
+        "known_threats", known_test, known_test["_label"].values,
+    ))
+    baseline_results.append(_evaluate_baseline(
+        "novel_threats", novel_df, novel_df["_label"].values,
+    ))
+
+    # ── Print report ─────────────────────────────────────────────────
     print_report(results, verbose=verbose)
+
+    # ── Validation summary ───────────────────────────────────────────
+    width = 72
+    print(_c("=" * width, _BLUE))
+    print(_c("  VALIDATION SET RESULTS (early stopping check)", _BOLD))
+    print(_c("-" * width, _GREY))
+    print(f"  Precision        :{_fmt_metric('precision', val_result['precision'])}")
+    print(f"  Recall           :{_fmt_metric('recall', val_result['recall'])}")
+    print(f"  F1-Score         :{_fmt_metric('f1_score', val_result['f1_score'])}")
+    print(f"  FPR              :{_fmt_metric('fpr', val_result['fpr'])}")
+
+    # ── ML vs Rules baseline comparison ──────────────────────────────
+    print()
+    print(_c("=" * width, _BLUE))
+    print(_c("  ML MODEL vs RULES-ONLY BASELINE (F1-Score)", _BOLD))
+    print(_c("-" * width, _GREY))
+    print(f"  {'Dataset':<45} {'ML F1':>8}  {'Rules F1':>9}  {'Delta':>8}")
+    print(f"  {'-'*45} {'-----':>8}  {'-'*9:>9}  {'-----':>8}")
+
+    for ml_r, bl_r in zip(results, baseline_results):
+        ml_f1 = ml_r["f1_score"]
+        bl_f1 = bl_r["f1_score"]
+        delta = ml_f1 - bl_f1 if not (np.isnan(ml_f1) or np.isnan(bl_f1)) else float("nan")
+        delta_str = f"+{delta:.3f}" if delta > 0 else f"{delta:.3f}" if not np.isnan(delta) else "N/A"
+        colour = _GREEN if delta > 0 else _RED
+        name = bl_r["dataset"][:45]
+        print(f"  {name:<45} {ml_f1:>8.4f}  {bl_f1:>9.4f}  {_c(delta_str, colour):>8}")
+
+    valid_ml = [r for r in results if not np.isnan(r["f1_score"])]
+    valid_bl = [r for r in baseline_results if not np.isnan(r["f1_score"])]
+    if valid_ml and valid_bl:
+        avg_ml = np.mean([r["f1_score"] for r in valid_ml])
+        avg_bl = np.mean([r["f1_score"] for r in valid_bl])
+        delta = avg_ml - avg_bl
+        colour = _GREEN if delta > 0 else _RED
+        print(f"  {'AVERAGE':<45} {avg_ml:>8.4f}  {avg_bl:>9.4f}  {_c(f'+{delta:.3f}' if delta > 0 else f'{delta:.3f}', colour):>8}")
+
+    # ── Hardware telemetry ───────────────────────────────────────────
+    print()
+    print(_c("=" * width, _BLUE))
+    print(_c("  HARDWARE TELEMETRY", _BOLD))
+    print(_c("-" * width, _GREY))
+    all_latencies = [r["median_time_us"] for r in results]
+    all_mems      = [r["peak_mem_mb"] for r in results]
+    print(f"  Median Latency   :  {np.median(all_latencies):.2f} µs / transaction")
+    print(f"  Peak Memory      :  {max(all_mems):.3f} MB  (across all test datasets)")
+    print(f"  RAM Capacity     :  {hw.get('ram_gb', '?')} {hw.get('ram_ok', '')}")
+    print(f"  CPU Architecture :  {hw['cpu']} ({hw['arch']})")
+    print(f"  Target Env       :  16 GB RAM — {'✅ MEETS REQUIREMENT' if '16' in hw.get('ram_gb', '') or float(hw.get('ram_gb', '0 GB').split()[0]) >= 16 else '⚠️  Below recommended'}")
+    print(_c("=" * width, _BLUE))
+    print()
 
 
 def parse_args() -> argparse.Namespace:
@@ -774,3 +1095,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     main(parse_args())
+

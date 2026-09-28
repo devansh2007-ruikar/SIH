@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# scripts/test_airgap.sh — MITHYA Air-Gap Isolation Test
+# scripts/test_airgap.sh — MITHYA Air-Gap Isolation Report
 # =============================================================================
 #
 # PURPOSE
@@ -11,33 +11,32 @@
 #
 # MECHANISM
 # ---------
-# Uses Linux "unshare" to create a new network namespace with NO network
-# interfaces (except loopback lo).  Inside this namespace:
-#   1.  All outbound TCP/UDP connections to non-loopback addresses will fail
-#       with ENETUNREACH or ECONNREFUSED.
-#   2.  We run the MITHYA test suite (pytest) and the ML evaluation script.
-#   3.  Any test/code that attempts an external connection will raise an
-#       exception, causing a FAIL.
-#   4.  If everything passes, we print an AIR-GAP PROOF certificate.
+# Uses Linux "unshare -r -n" to create a new user + network namespace with
+# NO external network interfaces (loopback only). Inside this namespace:
+#   1. All outbound TCP/UDP connections to non-loopback addresses fail.
+#   2. We run the full MITHYA test suite (pytest).
+#   3. Any code that attempts an external connection raises an exception.
+#   4. If everything passes, we print a clean Air-Gap Isolation Report.
 #
 # REQUIREMENTS
 # ------------
-#   - Linux kernel with CONFIG_USER_NS=y (most distros since 2013)
-#   - util-linux >= 2.27 (for unshare --net --user)
+#   - Linux kernel with CONFIG_USER_NS=y (Arch Linux default)
+#   - util-linux (for unshare)
+#   - curl (for connectivity verification)
 #   - Python 3.9+ and project venv activated (or PYTHON_BIN set)
 #   - pytest installed in the venv
 #
 # USAGE
 # -----
 #   bash scripts/test_airgap.sh
-#   bash scripts/test_airgap.sh --skip-streamlit   # skip UI smoke-test
-#   bash scripts/test_airgap.sh --verbose           # verbose pytest output
+#   bash scripts/test_airgap.sh --skip-streamlit
+#   bash scripts/test_airgap.sh --verbose
 #
 # EXIT CODES
 # ----------
-#   0 = All tests passed inside the air-gap namespace (PROOF COMPLETE)
+#   0 = All tests passed inside the air-gap namespace
 #   1 = One or more tests failed (network leak or logic error)
-#   2 = Prerequisite check failed (unshare/python not found)
+#   2 = Prerequisite check failed (unshare/curl/python not found)
 # =============================================================================
 
 set -euo pipefail
@@ -93,7 +92,7 @@ fi
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo -e ""
 echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════════${RESET}"
-echo -e "${BLUE}${BOLD}  MITHYA — Air-Gap Isolation Proof Script${RESET}"
+echo -e "${BLUE}${BOLD}  MITHYA — Air-Gap Isolation Report${RESET}"
 echo -e "${BLUE}  Problem Statement 26146 | SIH 2026${RESET}"
 echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════════${RESET}"
 echo -e ""
@@ -104,16 +103,24 @@ echo -e ""
 # ── Prerequisite checks ───────────────────────────────────────────────────────
 echo -e "${YELLOW}[*] Checking prerequisites...${RESET}"
 
-if ! command -v unshare &>/dev/null; then
-    echo -e "${RED}[!] 'unshare' not found. Install util-linux >= 2.27.${RESET}"
+# Check: curl
+if ! command -v curl &>/dev/null; then
+    echo -e "${RED}[!] 'curl' not found. Install with: sudo pacman -S curl${RESET}"
     exit 2
 fi
+echo -e "    curl      : $(curl --version 2>&1 | head -1)"
 
-UNSHARE_VERSION=$(unshare --version 2>&1 | head -1 || true)
-echo -e "    unshare   : ${UNSHARE_VERSION}"
+# Check: unshare
+if ! command -v unshare &>/dev/null; then
+    echo -e "${RED}[!] 'unshare' not found. Install util-linux: sudo pacman -S util-linux${RESET}"
+    exit 2
+fi
+echo -e "    unshare   : $(unshare --version 2>&1 | head -1)"
+
+# Check: Python
 echo -e "    python    : $("$PYTHON" --version 2>&1)"
 
-# Check if pytest is available
+# Check: pytest
 if ! "$PYTHON" -m pytest --version &>/dev/null; then
     echo -e "${YELLOW}[!] pytest not found — unit tests will be skipped.${RESET}"
     HAS_PYTEST=false
@@ -172,17 +179,37 @@ if command -v ip &>/dev/null; then
     ip link set lo up 2>/dev/null || true
     echo -e "  ${GREEN}[OK]${RESET} Loopback interface configured."
 else
-    echo -e "  ${YELLOW}[WARN]${RESET} 'ip' not found — skipping lo setup (usually already up)."
+    echo -e "  ${YELLOW}[WARN]${RESET} 'ip' not found — skipping lo setup."
 fi
 echo ""
 
 # ── Verify: external connectivity is BLOCKED ─────────────────────────────────
 echo -e "${YELLOW}[*] Verifying network isolation...${RESET}"
-if curl --max-time 2 --silent --head "https://8.8.8.8" &>/dev/null; then
-    echo -e "  ${RED}[FAIL]${RESET} External network is reachable — isolation failed!"
-    exit 1
+if command -v curl &>/dev/null; then
+    if curl --max-time 2 --silent --head "https://8.8.8.8" &>/dev/null; then
+        echo -e "  ${RED}[FAIL]${RESET} External network is reachable — isolation failed!"
+        exit 1
+    else
+        echo -e "  ${GREEN}[OK]${RESET} External network is unreachable (air-gap confirmed)."
+    fi
 else
-    echo -e "  ${GREEN}[OK]${RESET} External network is unreachable (air-gap confirmed)."
+    # Fallback: test via Python socket
+    if "$PYTHON" -c "
+import socket, sys
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(2)
+    s.connect(('8.8.8.8', 53))
+    s.close()
+    sys.exit(1)
+except:
+    sys.exit(0)
+"; then
+        echo -e "  ${GREEN}[OK]${RESET} External network is unreachable (air-gap confirmed)."
+    else
+        echo -e "  ${RED}[FAIL]${RESET} External network is reachable — isolation failed!"
+        exit 1
+    fi
 fi
 echo ""
 
@@ -224,75 +251,89 @@ if [[ -f "${PROJECT_ROOT}/tests/test_heuristics.py" && "$HAS_PYTEST" == "true" ]
         "$PYTHON" -m pytest ${PYTEST_ARGS} "${PROJECT_ROOT}/tests/test_heuristics.py"
 fi
 
-# ── Step 5: ML Evaluation (offline) ───────────────────────────────────────────
-echo -e "${BLUE}${BOLD}── STEP 5: ML validation evaluation (offline) ───────────────────${RESET}"
+# ── Step 5: XML Security Tests (XXE & Billion Laughs) ─────────────────────────
+echo -e "${BLUE}${BOLD}── STEP 5: XML security hardening tests ─────────────────────────${RESET}"
+if [[ "$HAS_PYTEST" == "true" ]]; then
+    PYTEST_ARGS="-x --tb=short"
+    [[ "$VERBOSE" == "true" ]] && PYTEST_ARGS="$PYTEST_ARGS -v"
+    run_step "pytest -k 'xxe or billion_laughs' tests/test_adapters.py" \
+        "$PYTHON" -m pytest ${PYTEST_ARGS} -k "xxe or billion_laughs" "${PROJECT_ROOT}/tests/test_adapters.py"
+fi
+
+# ── Step 6: Geo-ASN offline resolver ─────────────────────────────────────────
+echo -e "${BLUE}${BOLD}── STEP 6: Offline Geo-ASN resolver ────────────────────────────${RESET}"
+if [[ -f "${PROJECT_ROOT}/geo_asn.py" ]]; then
+    run_step "geo_asn.resolve_ip() offline test (strict unknown)" \
+        "$PYTHON" -c "
+import sys; sys.path.insert(0, '${PROJECT_ROOT}')
+from geo_asn import resolve_ip, resolve_ips_batch
+
+# Reserved ranges must always return correct labels
+r_priv = resolve_ip('10.0.0.1')
+assert r_priv['geo_country'] == 'PRIVATE', f'Expected PRIVATE, got {r_priv}'
+assert r_priv['asn'] == 'AS0', f'Expected AS0, got {r_priv}'
+print(f'  resolve_ip(10.0.0.1): country={r_priv[\"geo_country\"]} asn={r_priv[\"asn\"]} org={r_priv[\"asn_org\"]}')
+
+r_lo = resolve_ip('127.0.0.1')
+assert r_lo['geo_country'] == 'LOCAL', f'Expected LOCAL, got {r_lo}'
+print(f'  resolve_ip(127.0.0.1): country={r_lo[\"geo_country\"]} asn={r_lo[\"asn\"]} org={r_lo[\"asn_org\"]}')
+
+# Invalid IP must return strict unknown
+r_bad = resolve_ip('invalid_ip')
+assert r_bad['geo_country'] == 'XX', f'Expected XX, got {r_bad}'
+assert r_bad['asn'] == 'AS0', f'Expected AS0, got {r_bad}'
+assert r_bad['asn_org'] == 'Unknown', f'Expected Unknown, got {r_bad}'
+print(f'  resolve_ip(invalid): country={r_bad[\"geo_country\"]} asn={r_bad[\"asn\"]} (strict unknown: OK)')
+
+# Batch test
+batch = resolve_ips_batch(['8.8.8.8', '10.0.0.1', '192.168.1.1', 'nan'])
+assert len(batch) == 4, f'Expected 4 results, got {len(batch)}'
+print(f'  batch(4 IPs): {len(batch)} results')
+print('  Geo-ASN offline resolver: OK (never fabricates data)')
+"
+fi
+
+# ── Step 7: ML Evaluation (offline) ───────────────────────────────────────────
+echo -e "${BLUE}${BOLD}── STEP 7: ML validation evaluation (offline) ───────────────────${RESET}"
 if [[ -f "${PROJECT_ROOT}/evaluate_model.py" ]]; then
     run_step "evaluate_model.py --records 100" \
         "$PYTHON" "${PROJECT_ROOT}/evaluate_model.py" --records 100
 fi
 
-# ── Step 6: Streamlit smoke-test (import only, no server start) ───────────────
-echo -e "${BLUE}${BOLD}── STEP 6: Streamlit import smoke-test ──────────────────────────${RESET}"
+# ── Step 8: Streamlit smoke-test (import only, no server start) ───────────────
+echo -e "${BLUE}${BOLD}── STEP 8: Streamlit import smoke-test ──────────────────────────${RESET}"
 if [[ "$SKIP_STREAMLIT" != "true" ]]; then
     run_step "Streamlit + app imports (no CDN/API call)" \
         "$PYTHON" -c "
 import sys; sys.path.insert(0, '${PROJECT_ROOT}')
-import streamlit  # must not phone home during import
-print('  streamlit import: OK')
-# Verify the AirGapSocket override in app.py will work
-import socket
-orig = socket.socket
-class _TestSocket(orig):
-    def connect(self, addr):
-        host = addr[0] if isinstance(addr, tuple) else addr
-        if host not in ('127.0.0.1', 'localhost', '::1'):
-            raise PermissionError(f'Air-Gap: blocked {host}')
-        return super().connect(addr)
-socket.socket = _TestSocket
-print('  AirGapSocket override: OK')
-socket.socket = orig
+import streamlit
+print('  streamlit import: OK (no network phone-home)')
 "
 else
     echo -e "  ${YELLOW}[SKIP]${RESET} --skip-streamlit flag set"
 fi
 
-# ── Step 7: Geo-ASN offline resolver ─────────────────────────────────────────
-echo -e "${BLUE}${BOLD}── STEP 7: Offline Geo-ASN resolver ────────────────────────────${RESET}"
-if [[ -f "${PROJECT_ROOT}/geo_asn.py" ]]; then
-    run_step "geo_asn.resolve_ip() offline test" \
-        "$PYTHON" -c "
-import sys; sys.path.insert(0, '${PROJECT_ROOT}')
-from geo_asn import resolve_ip, resolve_ips_batch
-r1 = resolve_ip('1.1.1.1')
-r2 = resolve_ip('9.9.9.9')
-batch = resolve_ips_batch(['8.8.8.8', '10.0.0.1', '192.168.1.1'])
-print(f'  resolve_ip(1.1.1.1): country={r1[\"geo_country\"]} asn={r1[\"asn\"]}')
-print(f'  resolve_ip(9.9.9.9): country={r2[\"geo_country\"]} asn={r2[\"asn\"]}')
-print(f'  batch(3 IPs): {len(batch)} results')
-print('  Geo-ASN offline: OK')
-"
-fi
-
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════════${RESET}"
-echo -e "${BLUE}${BOLD}  AIR-GAP ISOLATION TEST RESULTS${RESET}"
+echo -e "${BLUE}${BOLD}  AIR-GAP ISOLATION REPORT${RESET}"
 echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════════${RESET}"
 echo -e "  Steps Passed : ${GREEN}${BOLD}${PASS_COUNT}${RESET}"
 echo -e "  Steps Failed : $( [[ $FAIL_COUNT -gt 0 ]] && echo "${RED}${BOLD}${FAIL_COUNT}${RESET}" || echo "${GREEN}0${RESET}" )"
 echo ""
 
 if [[ $FAIL_COUNT -eq 0 ]]; then
-    echo -e "${GREEN}${BOLD}  AIR-GAP PROOF CERTIFICATE${RESET}"
-    echo -e "${GREEN}  =============================${RESET}"
-    echo -e "${GREEN}  The MITHYA prototype ran ${PASS_COUNT} test steps inside a${RESET}"
+    echo -e "${GREEN}${BOLD}  ┌─────────────────────────────────────────────────┐${RESET}"
+    echo -e "${GREEN}${BOLD}  │         AIR-GAP ISOLATION: VERIFIED             │${RESET}"
+    echo -e "${GREEN}${BOLD}  └─────────────────────────────────────────────────┘${RESET}"
+    echo -e "${GREEN}  The MITHYA prototype executed ${PASS_COUNT} test steps inside a${RESET}"
     echo -e "${GREEN}  Linux network namespace with ZERO external connectivity.${RESET}"
-    echo -e "${GREEN}  No external API calls, CDN loads, or telemetry were made.${RESET}"
-    echo -e "${GREEN}  The system is confirmed AIR-GAP COMPATIBLE.${RESET}"
+    echo -e "${GREEN}  No external API calls, CDN loads, or telemetry detected.${RESET}"
     echo -e ""
-    echo -e "${GREEN}  Tested at: $(date)${RESET}"
-    echo -e "${GREEN}  Namespace: unshare -n (network namespace isolation)${RESET}"
-    echo -e "${GREEN}  Python   : $(python3 --version 2>&1)${RESET}"
+    echo -e "${GREEN}  Tested at : $(date --iso-8601=seconds 2>/dev/null || date)${RESET}"
+    echo -e "${GREEN}  Namespace : unshare -r -n (user + network namespace)${RESET}"
+    echo -e "${GREEN}  Kernel    : $(uname -r)${RESET}"
+    echo -e "${GREEN}  Python    : $("$PYTHON" --version 2>&1)${RESET}"
     echo ""
     exit 0
 else
@@ -311,23 +352,28 @@ sed -i "s|__SKIP_STREAMLIT__|${SKIP_STREAMLIT}|g" "$INNER_SCRIPT"
 sed -i "s|__VERBOSE__|${VERBOSE}|g" "$INNER_SCRIPT"
 chmod +x "$INNER_SCRIPT"
 
-# ── Execute inside a new network namespace ────────────────────────────────────
-echo -e "${YELLOW}[*] Spawning network-isolated namespace via 'unshare -n'...${RESET}"
+# ── Execute inside a new user + network namespace ────────────────────────────
+echo -e "${YELLOW}[*] Spawning network-isolated namespace via 'unshare -r -n'...${RESET}"
 echo -e "    (all external TCP/UDP will fail inside this namespace)"
 echo -e ""
 
-# Try user + network namespace first (no root required on most distros)
-# Fall back to root-required network namespace if that fails.
-if unshare --net --user --map-root-user bash "$INNER_SCRIPT"; then
-    # Success already handled inside inner script
+# Use -r -n (map root in user namespace + new network namespace)
+# This is the recommended approach for Arch Linux (unprivileged user namespaces
+# are enabled by default).
+if unshare -r -n bash "$INNER_SCRIPT"; then
+    true
+elif unshare --net --user --map-root-user bash "$INNER_SCRIPT"; then
+    # Fallback for older util-linux versions
     true
 elif unshare --net bash "$INNER_SCRIPT"; then
-    # Success already handled inside inner script
+    # Last resort (may require root)
     true
 else
-    echo -e "${RED}[!] 'unshare --net' failed.${RESET}"
-    echo -e "${YELLOW}    On some systems you need to enable unprivileged namespaces:${RESET}"
-    echo -e "      sudo sysctl kernel.unprivileged_userns_clone=1"
-    echo -e "    Or run this script as root / with sudo."
+    echo -e "${RED}[!] 'unshare' failed. Possible fixes:${RESET}"
+    echo -e "${YELLOW}    1. Enable unprivileged user namespaces:${RESET}"
+    echo -e "       sudo sysctl kernel.unprivileged_userns_clone=1"
+    echo -e "${YELLOW}    2. On Arch Linux, check:${RESET}"
+    echo -e "       sysctl kernel.unprivileged_userns_clone"
+    echo -e "${YELLOW}    3. Or run this script with sudo.${RESET}"
     exit 2
 fi

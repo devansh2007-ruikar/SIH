@@ -7,5 +7,6 @@ pyvis
 matplotlib
 networkx
 geoip2
+maxminddb
 requests
 defusedxml

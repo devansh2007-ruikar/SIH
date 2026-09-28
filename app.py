@@ -525,13 +525,22 @@ def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
     return enriched_df, features
 
 
+import hashlib
+
 # Determine data source and load
+file_hash = "N/A"
+ingest_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
 if uploaded_file is not None:
     try:
+        # Calculate SHA-256 of uploaded file for data provenance
+        file_bytes = uploaded_file.getvalue()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+
         # Save to a temporary file so the adapter can determine format by extension
         ext = os.path.splitext(uploaded_file.name)[1]
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(uploaded_file.getvalue())
+            tmp.write(file_bytes)
             tmp_path = tmp.name
 
         try:
@@ -552,17 +561,36 @@ if uploaded_file is not None:
                 f"</div>",
                 unsafe_allow_html=True,
             )
+            st.markdown(
+                f'<div style="font-size:0.75rem; color:#6b7280; padding:10px; background:#1f2937; border-radius:4px; margin-bottom:10px; border:1px solid #374151;">'
+                f'<b>🔒 SHA-256 Source Hash:</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
     except Exception as e:
         import traceback
         st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
         st.stop()
 elif os.path.isfile("bitcoin_traffic.csv"):
     try:
+        # Calculate SHA-256 of default dataset
+        with open("bitcoin_traffic.csv", "rb") as f:
+            file_bytes = f.read()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            
         adapter = get_adapter("bitcoin_traffic.csv")
         raw_df = adapter.load("bitcoin_traffic.csv")
         with st.spinner("🧠 AI Engine running on default dataset..."):
             df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
             data_source = "default"
+            
+        with st.sidebar:
+             st.markdown(
+                f'<div style="font-size:0.75rem; color:#6b7280; padding:10px; background:#1f2937; border-radius:4px; margin-bottom:10px; border:1px solid #374151;">'
+                f'<b>🔒 SHA-256 Source Hash (Default CSV):</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )           
     except Exception as e:
         import traceback
         st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
@@ -750,6 +778,7 @@ with tab1:
 
     with exp_col2:
         # Court-ready report
+        import platform
         report_lines = [
             "=" * 70,
             "  MITHYA — Crypto Forensic Triage Report",
@@ -757,6 +786,15 @@ with tab1:
             f"  Engine: IsolationForest (n_estimators=200, contamination={contamination})",
             "=" * 70,
             "",
+            "  DATA PROVENANCE & CONFIGURATION",
+            "  -------------------------------",
+            f"  Ingestion Time:   {ingest_time}",
+            f"  Source File Hash: {file_hash} (SHA-256)",
+            f"  Model Version:    v1.4.0 (Graph-Aware Anomaly Detection)",
+            f"  System Config:    {platform.platform()} / Python {platform.python_version()}",
+            "",
+            "  ANALYSIS SUMMARY",
+            "  ----------------",
             f"  Total Transactions Analysed:  {total_tx:,}",
             f"  Institutional Transfers Cleared: {whitelisted_count}",
             f"  ML Anomalies Flagged:        {total_flagged}",
@@ -791,7 +829,7 @@ with tab1:
         st.download_button(
             label="📄 Generate Evidence Dossier",
             data=report_text.encode("utf-8"),
-            file_name="mithya_forensic_report.txt",
+            file_name=f"mithya_forensic_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             mime="text/plain",
             use_container_width=True,
         )
@@ -844,7 +882,7 @@ with tab2:
 
     # ── Build display table ──
     display_cols = [
-        "txid", "risk_score", "entity_id", "explanation",
+        "txid", "risk_score", "entity_id", "cluster_confidence", "explanation",
         "src_port", "dst_port", "total_amount_btc", "fee",
         "script_type", "geo_country", "asn",
     ]

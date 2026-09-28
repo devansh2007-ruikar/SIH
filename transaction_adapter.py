@@ -84,18 +84,17 @@ import os
 # defusedxml replaces stdlib xml.etree.ElementTree to prevent XXE / entity-
 # expansion attacks (billion laughs, external entity injection, etc.).
 # Reference: https://pypi.org/project/defusedxml/
+#
+# SECURITY POLICY: If defusedxml is not installed, we FAIL CLOSED.
+# There is NO fallback to the vulnerable stdlib xml.etree.ElementTree.
 try:
     import defusedxml.ElementTree as ET
-except ImportError as _defusedxml_err:
-    import warnings as _warnings_mod
-    _warnings_mod.warn(
-        "[SECURITY] defusedxml is not installed. Falling back to stdlib "
-        "xml.etree.ElementTree which is VULNERABLE to XXE attacks. "
-        "Install with: pip install defusedxml",
-        RuntimeWarning,
-        stacklevel=2,
+except ImportError:
+    raise RuntimeError(
+        "[SECURITY] defusedxml is REQUIRED but not installed. "
+        "The MITHYA prototype refuses to parse XML without XXE protection. "
+        "Install with: pip install defusedxml"
     )
-    import xml.etree.ElementTree as ET  # noqa: F401  # fallback (unsafe)
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -389,7 +388,16 @@ class BaseTransactionAdapter(ABC):
         # 9. Institutional whitelist
         enriched_df = ml_engine.apply_institutional_whitelist(enriched_df)
 
-        # 10. Optional export
+        # 10. Offline Geo-ASN enrichment (strict: XX/AS0 if no DB)
+        try:
+            from geo_asn import enrich_dataframe as _geo_enrich
+            if "src_ip" in enriched_df.columns:
+                enriched_df = _geo_enrich(enriched_df, ip_col="src_ip", inplace=False)
+                ml_engine._log("[*] Geo-ASN enrichment applied (offline MMDB).")
+        except ImportError:
+            ml_engine._log("[!] geo_asn module not available — skipping enrichment.")
+
+        # 11. Optional export
         if output_csv:
             ml_engine.export_results(enriched_df, output_csv)
 

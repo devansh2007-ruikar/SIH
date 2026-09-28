@@ -520,3 +520,128 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
 
     sys.exit(1 if failed else 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# XML SECURITY HARDENING TESTS (XXE & Billion Laughs)
+# ═══════════════════════════════════════════════════════════════════════════
+
+import pytest
+
+
+def test_xml_rejects_xxe_attack():
+    """
+    Prove that the BitcoinXMLAdapter rejects XML External Entity (XXE)
+    injection attacks.
+
+    An XXE payload attempts to exfiltrate local file contents (e.g.
+    /etc/passwd) by defining an external entity that the parser would
+    resolve if using the vulnerable stdlib xml.etree.ElementTree.
+
+    defusedxml MUST raise an error and refuse to parse this document.
+    """
+    xxe_payload = textwrap.dedent("""\
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE transactions [
+          <!ENTITY xxe SYSTEM "file:///etc/passwd">
+        ]>
+        <transactions>
+          <transaction>
+            <txid>&xxe;</txid>
+            <input_addresses>addr1</input_addresses>
+            <output_addresses>addr2</output_addresses>
+            <input_amounts>1.0</input_amounts>
+            <output_amounts>0.99</output_amounts>
+            <fee>0.01</fee>
+            <src_port>8333</src_port>
+          </transaction>
+        </transactions>
+    """)
+
+    adapter = BitcoinXMLAdapter()
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".xml", delete=False,
+    ) as f:
+        f.write(xxe_payload)
+        f.flush()
+        tmp_path = f.name
+
+    try:
+        # defusedxml should raise an error (EntitiesForbidden or similar)
+        # when encountering the DTD with external entity reference.
+        with pytest.raises((ValueError, Exception)) as exc_info:
+            adapter.load(tmp_path)
+
+        # Verify the error is security-related (not just malformed XML)
+        error_msg = str(exc_info.value).lower()
+        assert any(
+            keyword in error_msg
+            for keyword in ("entitiesforbidden", "forbid", "dtd", "entity", "malformed")
+        ), (
+            f"Expected a security-related rejection, got: {exc_info.value}"
+        )
+    finally:
+        os.remove(tmp_path)
+
+
+def test_xml_rejects_billion_laughs_attack():
+    """
+    Prove that the BitcoinXMLAdapter rejects Billion Laughs (exponential
+    entity expansion) attacks.
+
+    A Billion Laughs payload defines nested internal entities that
+    expand exponentially, consuming gigabytes of RAM if parsed naïvely.
+    defusedxml MUST refuse this document at parse time.
+    """
+    billion_laughs_payload = textwrap.dedent("""\
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE lolz [
+          <!ENTITY lol "lol">
+          <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+          <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+          <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">
+          <!ENTITY lol5 "&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;">
+          <!ENTITY lol6 "&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;">
+          <!ENTITY lol7 "&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;">
+          <!ENTITY lol8 "&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;">
+          <!ENTITY lol9 "&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;">
+        ]>
+        <transactions>
+          <transaction>
+            <txid>&lol9;</txid>
+            <input_addresses>addr1</input_addresses>
+            <output_addresses>addr2</output_addresses>
+            <input_amounts>1.0</input_amounts>
+            <output_amounts>0.99</output_amounts>
+            <fee>0.01</fee>
+            <src_port>8333</src_port>
+          </transaction>
+        </transactions>
+    """)
+
+    adapter = BitcoinXMLAdapter()
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".xml", delete=False,
+    ) as f:
+        f.write(billion_laughs_payload)
+        f.flush()
+        tmp_path = f.name
+
+    try:
+        # defusedxml should raise an error when encountering the
+        # exponentially-expanding entity definitions in the DTD.
+        with pytest.raises((ValueError, Exception)) as exc_info:
+            adapter.load(tmp_path)
+
+        error_msg = str(exc_info.value).lower()
+        assert any(
+            keyword in error_msg
+            for keyword in ("entitiesforbidden", "forbid", "dtd", "entity", "malformed")
+        ), (
+            f"Expected a security-related rejection, got: {exc_info.value}"
+        )
+    finally:
+        os.remove(tmp_path)
+
