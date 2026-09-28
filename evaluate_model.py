@@ -69,6 +69,7 @@ try:
         recall_score,
         f1_score,
         confusion_matrix,
+        classification_report,
     )
 except ImportError as exc:
     sys.exit(f"[!] scikit-learn required: {exc}")
@@ -230,6 +231,94 @@ def generate_benign_traffic(n: int = 300) -> pd.DataFrame:
         })
 
     # ── Hard negative: Multi-sig treasury consolidation ─────────────
+    for _ in range(n_treasury):
+        n_in = int(_rng.integers(10, 30))
+        total = round(float(_rng.uniform(5.0, 50.0)), 6)
+        records.append({
+            "timestamp":        _ts(),
+            "txid":             fake.sha256(),
+            "src_ip":           _src_ip(),
+            "dst_ip":           _src_ip(),
+            "src_port":         443,
+            "dst_port":         8333,
+            "input_addresses":  _pipe([_btc_addr("3") for _ in range(n_in)]),
+            "output_addresses": _btc_addr("bc1q"),
+            "input_amounts":    _pipe([round(total / n_in, 8)] * n_in),
+            "output_amounts":   str(round(total * 0.999, 8)),
+            "fee":              round(total * 0.001, 8),
+            "script_type":      "P2SH",
+            "geo_country":      _rng.choice(["US", "CH", "SG"]),
+            "asn":              f"AS{int(_rng.choice([16509, 8075, 13335]))}",
+            "_label":           0,
+        })
+
+    return pd.DataFrame(records)
+
+
+# ----------------------------------------------------------------------------
+# 1b. Hard Negatives — standalone generator for unified evaluation
+# ----------------------------------------------------------------------------
+
+def generate_hard_negatives(n: int = 100) -> pd.DataFrame:
+    """
+    Actively generate hard-negative transactions that are benign yet
+    structurally close to threats (high-value settlements, mining payouts,
+    treasury consolidations with anomalous fan-in/fan-out).
+
+    This MUST be called independently so the unified test set contains
+    challenging benign examples that would otherwise inflate precision
+    if only easy benign samples were used.
+    """
+    records = []
+    n_exchange    = int(n * 0.30)
+    n_mining_pool = int(n * 0.35)
+    n_treasury    = n - n_exchange - n_mining_pool
+
+    # Hard negative: high-value exchange settlements (round amounts)
+    for _ in range(n_exchange):
+        total = round(float(_rng.choice([10, 25, 50, 100, 250])), 2)
+        n_out = int(_rng.integers(1, 3))
+        records.append({
+            "timestamp":        _ts(),
+            "txid":             fake.sha256(),
+            "src_ip":           _src_ip(),
+            "dst_ip":           _src_ip(),
+            "src_port":         443,
+            "dst_port":         8333,
+            "input_addresses":  _pipe([_btc_addr("bc1q") for _ in range(int(_rng.integers(2, 5)))]),
+            "output_addresses": _pipe([_btc_addr("bc1q") for _ in range(n_out)]),
+            "input_amounts":    str(total),
+            "output_amounts":   _pipe([round(total * 0.99 / n_out, 8)] * n_out),
+            "fee":              round(total * 0.0005, 8),
+            "script_type":      "P2WPKH",
+            "geo_country":      _rng.choice(["US", "SG", "JP", "DE"]),
+            "asn":              f"AS{int(_rng.choice([16509, 13335, 15169]))}",
+            "_label":           0,
+        })
+
+    # Hard negative: Mining pool payouts (1-in, many-out, ~equal)
+    for _ in range(n_mining_pool):
+        n_out = int(_rng.integers(20, 60))
+        payout = round(float(_rng.uniform(0.001, 0.01)), 6)
+        records.append({
+            "timestamp":        _ts(),
+            "txid":             fake.sha256(),
+            "src_ip":           _src_ip(),
+            "dst_ip":           _src_ip(),
+            "src_port":         8333,
+            "dst_port":         8333,
+            "input_addresses":  _btc_addr("bc1q"),
+            "output_addresses": _pipe([_btc_addr("bc1q") for _ in range(n_out)]),
+            "input_amounts":    str(round(payout * n_out * 1.01, 8)),
+            "output_amounts":   _pipe([round(payout * float(_rng.uniform(0.95, 1.05)), 8) for _ in range(n_out)]),
+            "fee":              round(0.00005 * n_out, 8),
+            "script_type":      "P2WPKH",
+            "geo_country":      _rng.choice(["US", "CN", "IS", "KZ"]),
+            "asn":              f"AS{int(_rng.integers(1000, 65000))}",
+            "_label":           0,
+        })
+
+    # Hard negative: Multi-sig treasury consolidation
     for _ in range(n_treasury):
         n_in = int(_rng.integers(10, 30))
         total = round(float(_rng.uniform(5.0, 50.0)), 6)
@@ -904,6 +993,8 @@ def main(args: argparse.Namespace) -> None:
     benign_df = generate_benign_traffic(n)
     known_df  = generate_known_threats(n)
     novel_df  = generate_novel_threats(n)
+    # Actively generate hard negatives as a standalone challenging benign set
+    hard_negatives_df = generate_hard_negatives(n)
 
     # ── Strict Train / Validation / Test split (60 / 20 / 20) ────────
     print(_c("[*] Splitting data: Train (60%) / Validation (20%) / Test (20%)...", _BLUE))
@@ -922,6 +1013,7 @@ def main(args: argparse.Namespace) -> None:
     benign_train, benign_val, benign_test = _split_df(benign_df)
     known_train,  known_val,  known_test  = _split_df(known_df)
     _,            _,          novel_test  = _split_df(novel_df)
+    hard_train,   hard_val,   hard_negatives_test = _split_df(hard_negatives_df)
 
     # ── Build features ───────────────────────────────────────────────
     print(_c("[*] Building feature matrices...", _BLUE))
@@ -933,18 +1025,24 @@ def main(args: argparse.Namespace) -> None:
     X_benign_test  = build_features(benign_test)
     X_known_test   = build_features(known_test)
     X_novel_test   = build_features(novel_df)
+    X_hard_train   = build_features(hard_train)
+    X_hard_val     = build_features(hard_val)
+    X_hard_test    = build_features(hard_negatives_test)
 
-    # Training corpus: benign_train + known_train
+    # Training corpus: benign_train + known_train (+ hard hard negatives awareness)
     X_train = pd.concat([X_benign_train, X_known_train], ignore_index=True)
 
-    # Align columns
+    # Align columns across all feature frames (including hard negatives + unified)
     all_cols = sorted(
         set(X_train.columns)
         | set(X_benign_val.columns)
         | set(X_novel_test.columns)
+        | set(X_hard_test.columns)
+        | set(X_hard_val.columns)
     )
     for xdf in [X_train, X_benign_val, X_known_val,
-                X_benign_test, X_known_test, X_novel_test]:
+                X_benign_test, X_known_test, X_novel_test,
+                X_hard_test, X_hard_val, X_hard_train]:
         for col in all_cols:
             if col not in xdf.columns:
                 xdf[col] = 0.0
@@ -955,6 +1053,9 @@ def main(args: argparse.Namespace) -> None:
     X_benign_test = X_benign_test[all_cols].fillna(0.0)
     X_known_test  = X_known_test[all_cols].fillna(0.0)
     X_novel_test  = X_novel_test[all_cols].fillna(0.0)
+    X_hard_test   = X_hard_test[all_cols].fillna(0.0)
+    X_hard_val    = X_hard_val[all_cols].fillna(0.0)
+    X_hard_train  = X_hard_train[all_cols].fillna(0.0)
 
     print(_c(
         f"[*] Training IsolationForest "
@@ -964,7 +1065,7 @@ def main(args: argparse.Namespace) -> None:
     print(_c(
         f"    Train: {len(X_train)} rows  |  "
         f"Val: {len(benign_val) + len(known_val)} rows  |  "
-        f"Test: {len(benign_test) + len(known_test) + len(novel_df)} rows",
+        f"Test: {len(benign_test) + len(hard_negatives_test) + len(known_test) + len(novel_df)} rows",
         _GREY,
     ))
 
@@ -985,37 +1086,125 @@ def main(args: argparse.Namespace) -> None:
         val_df, val_labels,
     )
 
-    # ── Evaluate on 3 Test datasets ──────────────────────────────────
-    print(_c("[*] Evaluating on 3 Test dataset categories...", _BLUE))
+    # ── UNIFIED TEST SET (statistically valid — fixes NaN/N/A) ──────
+    # Concatenate benign_traffic, hard_negatives, and known_threats into a
+    # single unified test DataFrame and evaluate with IsolationForest-native
+    # labels (1 = benign/normal, -1 = threat/anomaly).
+    print(_c("[*] Building UNIFIED test set (benign + hard_negatives + known_threats)...", _BLUE))
+    unified_test_df = pd.concat(
+        [benign_test, hard_negatives_test, known_test], ignore_index=True
+    )
+    # Shuffle deterministically for valid joint distribution
+    unified_test_df = unified_test_df.sample(frac=1.0, random_state=_SEED).reset_index(drop=True)
+
+    # Create unified y_true where benign and hard negatives equal 1, known threats equal -1
+    y_true = np.where(unified_test_df["_label"].values == 1, -1, 1)
+
+    # Build features for unified set and align columns
+    X_unified_test = build_features(unified_test_df)
+    for col in all_cols:
+        if col not in X_unified_test.columns:
+            X_unified_test[col] = 0.0
+    # Add any extra columns from unified that were not in all_cols
+    for col in X_unified_test.columns:
+        if col not in all_cols:
+            all_cols.append(col)
+    X_unified_test = X_unified_test[all_cols].fillna(0.0) if all(col in X_unified_test.columns for col in all_cols) else X_unified_test.fillna(0.0)
+    # Re-align training feature cols for prediction consistency
+    # (evaluator stores its own feature cols from fit, so we only ensure X_unified has them)
+    for col in evaluator._feature_cols:
+        if col not in X_unified_test.columns:
+            X_unified_test[col] = 0.0
+    X_unified_aligned = X_unified_test[evaluator._feature_cols].fillna(0.0)
+
+    # Run IsolationForest prediction on this combined dataset to generate unified y_pred
+    # IsolationForest returns 1 for inliers (benign) and -1 for outliers (threats)
+    y_pred = evaluator.model.predict(X_unified_aligned.values)
+
+    # Calculate statistically valid metrics on the combined arrays
+    unified_precision = precision_score(y_true, y_pred, pos_label=-1, zero_division=0)
+    unified_recall = recall_score(y_true, y_pred, pos_label=-1, zero_division=0)
+    unified_f1 = f1_score(y_true, y_pred, pos_label=-1, zero_division=0)
+    unified_report = classification_report(
+        y_true, y_pred, labels=[1, -1], target_names=["benign (1)", "threat (-1)"], zero_division=0
+    )
+    # Also keep benign-as-positive view for completeness
+    unified_report_full = classification_report(y_true, y_pred, zero_division=0)
+
+    print(_c("\n  ── UNIFIED TEST SET METRICS (benign + hard_negatives + known_threats) ──", _CYAN + _BOLD))
+    print(f"  Unified n_total      : {len(unified_test_df)}  "
+          f"({(y_true==1).sum()} benign/hard  /  {(y_true==-1).sum()} threats)")
+    print(f"  Precision (threat)   :  {unified_precision:.4f}")
+    print(f"  Recall (threat)      :  {unified_recall:.4f}")
+    print(f"  F1-Score (threat)    :  {unified_f1:.4f}")
+    print(_c("\n  Classification Report (unified, labels 1 / -1):", _GREY))
+    for line in unified_report.splitlines():
+        print(f"  {line}")
+    # Timing / memory for unified set
+    tracemalloc.start()
+    _, unified_median_us = evaluator._predict_timed(X_unified_aligned)
+    _current, unified_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    unified_peak_mb = unified_peak / (1024 ** 2)
+    print(f"\n  Median Latency (unified):  {unified_median_us:.2f} us / transaction")
+    print(f"  Peak Memory (unified)   :  {unified_peak_mb:.3f} MB")
+
+    # ── Evaluate Novel Threats ──────────────────────────────────────────
+    print(_c("[*] Evaluating Novel Threats (mixed with benign for valid metrics)...", _BLUE))
 
     results = []
+    # Replace isolated single-class evaluations with mixed-aware handling by
+    # including the unified result as the primary valid entry
+    unified_result = {
+        "dataset":        "UNIFIED  (benign_traffic + hard_negatives + known_threats)",
+        "n_total":        len(unified_test_df),
+        "n_threats":      int((y_true == -1).sum()),
+        "n_benign":       int((y_true == 1).sum()),
+        "precision":      unified_precision,
+        "recall":         unified_recall,
+        "f1_score":       unified_f1,
+        "fpr":            float(((y_pred == -1) & (y_true == 1)).sum() / max(((y_true == 1).sum()), 1)),
+        "median_time_us": unified_median_us,
+        "peak_mem_mb":    unified_peak_mb,
+        "pred_labels":    (y_pred == -1).astype(int),  # map -1->1 threat, 1->0 benign for report compat
+        "true_labels":    (y_true == -1).astype(int),
+        "y_true_native":  y_true,
+        "y_pred_native":  y_pred,
+        "cls_report":     unified_report,
+    }
+    results.append(unified_result)
+
+    novel_unified_df = pd.concat([benign_test, hard_negatives_test, novel_df], ignore_index=True)
     results.append(evaluator.evaluate_dataset(
-        "benign_traffic  (exchanges / mining pools / treasury — hard negatives)",
-        benign_test,
-        benign_test["_label"].values,
-    ))
-    results.append(evaluator.evaluate_dataset(
-        "known_threats   (peel chains / mixers / fee spikes)",
-        known_test,
-        known_test["_label"].values,
-    ))
-    results.append(evaluator.evaluate_dataset(
-        "novel_threats   (dust dispersal / I2P sweep / consolidate-split)",
-        novel_df,
-        novel_df["_label"].values,
+        "UNIFIED NOVEL  (benign_traffic + hard_negatives + novel_threats)",
+        novel_unified_df,
+        novel_unified_df["_label"].values,
     ))
 
-    # ── Rules-only baseline ──────────────────────────────────────────
+    # ── Rules-only baseline (also on unified set) ────────────────────
     print(_c("[*] Computing rules-only baseline for comparison...", _BLUE))
     baseline_results = []
+    # Unified baseline
+    unified_pred_rules = _rules_only_predict(unified_test_df)
+    # Map rules 0/1 to 1/-1 to match y_true native for fair scoring
+    unified_pred_rules_native = np.where(unified_pred_rules == 1, -1, 1)
+    baseline_unified_prec = precision_score(y_true, unified_pred_rules_native, pos_label=-1, zero_division=0)
+    baseline_unified_rec  = recall_score(y_true, unified_pred_rules_native, pos_label=-1, zero_division=0)
+    baseline_unified_f1   = f1_score(y_true, unified_pred_rules_native, pos_label=-1, zero_division=0)
+    baseline_unified_report = classification_report(
+        y_true, unified_pred_rules_native, labels=[1, -1], target_names=["benign (1)", "threat (-1)"], zero_division=0
+    )
+    baseline_results.append({
+        "dataset":   "UNIFIED  (benign+hard+known) — rules",
+        "precision": baseline_unified_prec,
+        "recall":    baseline_unified_rec,
+        "f1_score":  baseline_unified_f1,
+        "fpr":       float(((unified_pred_rules_native == -1) & (y_true == 1)).sum() / max(((y_true == 1).sum()), 1)),
+        "cls_report": baseline_unified_report,
+    })
+
     baseline_results.append(_evaluate_baseline(
-        "benign_traffic", benign_test, benign_test["_label"].values,
-    ))
-    baseline_results.append(_evaluate_baseline(
-        "known_threats", known_test, known_test["_label"].values,
-    ))
-    baseline_results.append(_evaluate_baseline(
-        "novel_threats", novel_df, novel_df["_label"].values,
+        "UNIFIED NOVEL  (benign+hard+novel)", novel_unified_df, novel_unified_df["_label"].values,
     ))
 
     # ── Print report ─────────────────────────────────────────────────
