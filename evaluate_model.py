@@ -687,13 +687,19 @@ class ModelEvaluator:
         name: str,
         df: pd.DataFrame,
         true_labels: np.ndarray,
+        X_precomputed: pd.DataFrame = None,
     ) -> Dict:
         """
         Run evaluation for a single named dataset and return a metrics dict.
+        If X_precomputed is provided, it is used directly instead of calling
+        build_features() — this ensures consistent scaling across splits.
         """
         assert self.model is not None, "Call fit() before evaluate_dataset()"
 
-        X = build_features(df)
+        if X_precomputed is not None:
+            X = X_precomputed.copy()
+        else:
+            X = build_features(df)
         for col in self._feature_cols:
             if col not in X.columns:
                 X[col] = 0.0
@@ -1017,19 +1023,46 @@ def main(args: argparse.Namespace) -> int:
     _,            _,          novel_test  = _split_df(novel_df)
     hard_train,   hard_val,   hard_negatives_test = _split_df(hard_negatives_df)
 
-    # ── Build features ───────────────────────────────────────────────
-    print(_c("[*] Building feature matrices...", _BLUE))
+    # ── Build features ONCE on the full combined dataset ─────────────
+    # engineer_features() internally fits scaling statistics (MinMaxScaler,
+    # z-score mean/std, frequency encoding) on whatever DataFrame is passed.
+    # Computing features per-slice gives the SAME transaction different
+    # feature values depending on which slice it's in, making the
+    # IsolationForest's training-time boundaries meaningless at test time.
+    # Fix: concatenate everything, compute once, slice back.
+    print(_c("[*] Building feature matrices (single-pass for consistent scaling)...", _BLUE))
 
-    X_benign_train = build_features(benign_train)
-    X_known_train  = build_features(known_train)
-    X_benign_val   = build_features(benign_val)
-    X_known_val    = build_features(known_val)
-    X_benign_test  = build_features(benign_test)
-    X_known_test   = build_features(known_test)
-    X_novel_test   = build_features(novel_df)
-    X_hard_train   = build_features(hard_train)
-    X_hard_val     = build_features(hard_val)
-    X_hard_test    = build_features(hard_negatives_test)
+    combined_raw = pd.concat(
+        [benign_df, known_df, novel_df, hard_negatives_df],
+        ignore_index=True,
+    )
+    X_combined = build_features(combined_raw)
+    all_cols = sorted(X_combined.columns.tolist())
+    X_combined = X_combined[all_cols].fillna(0.0)
+
+    # Slice back by known dataset sizes
+    n_b, n_k, n_v, n_h = len(benign_df), len(known_df), len(novel_df), len(hard_negatives_df)
+    offset = 0
+    X_benign_all = X_combined.iloc[offset:offset + n_b].reset_index(drop=True); offset += n_b
+    X_known_all  = X_combined.iloc[offset:offset + n_k].reset_index(drop=True); offset += n_k
+    X_novel_all  = X_combined.iloc[offset:offset + n_v].reset_index(drop=True); offset += n_v
+    X_hard_all   = X_combined.iloc[offset:offset + n_h].reset_index(drop=True)
+
+    # Split each dataset's features using the same 60/20/20 boundaries
+    def _split_features(X_full, train_frac=0.6, val_frac=0.2):
+        nt = len(X_full)
+        n_train = int(nt * train_frac)
+        n_val   = int(nt * val_frac)
+        return (
+            X_full.iloc[:n_train].reset_index(drop=True),
+            X_full.iloc[n_train:n_train + n_val].reset_index(drop=True),
+            X_full.iloc[n_train + n_val:].reset_index(drop=True),
+        )
+
+    X_benign_train, X_benign_val, X_benign_test = _split_features(X_benign_all)
+    _,              X_known_val,  X_known_test  = _split_features(X_known_all)
+    # Novel threats are never used in training; X_novel_all is used whole for testing.
+    X_hard_train,   X_hard_val,   X_hard_test   = _split_features(X_hard_all)
 
     # Training corpus: benign + hard negatives ONLY.
     # IsolationForest is unsupervised — it assumes the training set is mostly
@@ -1038,31 +1071,6 @@ def main(args: argparse.Namespace) -> int:
     # Hard negatives are legitimate traffic that merely *looks* attack-like,
     # so they strengthen the "normal" boundary without poisoning it.
     X_train = pd.concat([X_benign_train, X_hard_train], ignore_index=True)
-
-    # Align columns across all feature frames (including hard negatives + unified)
-    all_cols = sorted(
-        set(X_train.columns)
-        | set(X_benign_val.columns)
-        | set(X_novel_test.columns)
-        | set(X_hard_test.columns)
-        | set(X_hard_val.columns)
-    )
-    for xdf in [X_train, X_benign_val, X_known_val,
-                X_benign_test, X_known_test, X_novel_test,
-                X_hard_test, X_hard_val, X_hard_train]:
-        for col in all_cols:
-            if col not in xdf.columns:
-                xdf[col] = 0.0
-
-    X_train       = X_train[all_cols].fillna(0.0)
-    X_benign_val  = X_benign_val[all_cols].fillna(0.0)
-    X_known_val   = X_known_val[all_cols].fillna(0.0)
-    X_benign_test = X_benign_test[all_cols].fillna(0.0)
-    X_known_test  = X_known_test[all_cols].fillna(0.0)
-    X_novel_test  = X_novel_test[all_cols].fillna(0.0)
-    X_hard_test   = X_hard_test[all_cols].fillna(0.0)
-    X_hard_val    = X_hard_val[all_cols].fillna(0.0)
-    X_hard_train  = X_hard_train[all_cols].fillna(0.0)
 
     print(_c(
         f"[*] Training IsolationForest "
@@ -1086,11 +1094,13 @@ def main(args: argparse.Namespace) -> int:
     # ── Evaluate on Validation set ───────────────────────────────────
     print(_c("[*] Evaluating on Validation set...", _BLUE))
     val_df = pd.concat([benign_val, known_val], ignore_index=True)
+    X_val  = pd.concat([X_benign_val, X_known_val], ignore_index=True)
     val_labels = val_df["_label"].values
 
     val_result = evaluator.evaluate_dataset(
         "VALIDATION  (benign_val + known_val)",
         val_df, val_labels,
+        X_precomputed=X_val,
     )
 
     # ── UNIFIED TEST SET (statistically valid — fixes NaN/N/A) ──────
@@ -1101,24 +1111,19 @@ def main(args: argparse.Namespace) -> int:
     unified_test_df = pd.concat(
         [benign_test, hard_negatives_test, known_test], ignore_index=True
     )
-    # Shuffle deterministically for valid joint distribution
-    unified_test_df = unified_test_df.sample(frac=1.0, random_state=_SEED).reset_index(drop=True)
+    X_unified_test = pd.concat(
+        [X_benign_test, X_hard_test, X_known_test], ignore_index=True
+    )
+    # Shuffle both DF and features with the same permutation
+    shuffle_order = unified_test_df.sample(frac=1.0, random_state=_SEED).index
+    unified_test_df = unified_test_df.loc[shuffle_order].reset_index(drop=True)
+    X_unified_test  = X_unified_test.loc[shuffle_order].reset_index(drop=True)
 
     # Create unified y_true where benign and hard negatives equal 1, known threats equal -1
     y_true = np.where(unified_test_df["_label"].values == 1, -1, 1)
 
-    # Build features for unified set and align columns
-    X_unified_test = build_features(unified_test_df)
-    for col in all_cols:
-        if col not in X_unified_test.columns:
-            X_unified_test[col] = 0.0
-    # Add any extra columns from unified that were not in all_cols
-    for col in X_unified_test.columns:
-        if col not in all_cols:
-            all_cols.append(col)
-    X_unified_test = X_unified_test[all_cols].fillna(0.0) if all(col in X_unified_test.columns for col in all_cols) else X_unified_test.fillna(0.0)
-    # Re-align training feature cols for prediction consistency
-    # (evaluator stores its own feature cols from fit, so we only ensure X_unified has them)
+    # Align to evaluator's feature columns (all come from one build_features call,
+    # so columns are already consistent — this is a safety net)
     for col in evaluator._feature_cols:
         if col not in X_unified_test.columns:
             X_unified_test[col] = 0.0
@@ -1182,10 +1187,12 @@ def main(args: argparse.Namespace) -> int:
     results.append(unified_result)
 
     novel_unified_df = pd.concat([benign_test, hard_negatives_test, novel_df], ignore_index=True)
+    X_novel_unified = pd.concat([X_benign_test, X_hard_test, X_novel_all], ignore_index=True)
     results.append(evaluator.evaluate_dataset(
         "UNIFIED NOVEL  (benign_traffic + hard_negatives + novel_threats)",
         novel_unified_df,
         novel_unified_df["_label"].values,
+        X_precomputed=X_novel_unified,
     ))
 
     # ── Rules-only baseline (also on unified set) ────────────────────
