@@ -3,12 +3,12 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![Hackathon](https://img.shields.io/badge/SIH-2026-ff69b4.svg)](https://sih.gov.in/)
 [![Security](https://img.shields.io/badge/XML-defusedxml%20XXE--safe-green.svg)](https://pypi.org/project/defusedxml/)
-[![Air-Gap](https://img.shields.io/badge/Air--Gap-Verified-brightgreen.svg)](#phase-2b-air-gap-proof--scriptstest_airgapsh)
-[![ML Validated](https://img.shields.io/badge/ML-Benchmarked%20Precision%2FRecall%2FF1%2FFPR-blue.svg)](#phase-1-ml-validation--benchmarking--evaluate_modelpy)
+[![Air-Gap](https://img.shields.io/badge/Air--Gap-Offline%20Design-blue.svg)](#phase-2b-air-gap-proof--scriptstest_airgapsh)
+[![ML Status](https://img.shields.io/badge/ML-Evaluation%20Harness%20Built-yellow.svg)](#known-limitations)
 
 **MITHYA** is an offline, graph-aware cryptocurrency forensics and triage engine built for **Smart India Hackathon 2026 — Problem Statement 26146**. It ingests raw network/blockchain traffic, clusters wallet entities using Evidence-Based Confidence Tiers, and scores transactions for illicit behaviour using unsupervised machine learning — fully air-gapped, with no external API or CDN dependencies.
 
-> **Security & Forensic Hardening Notice (v2.0):** This release implements major enterprise-grade security and ML upgrades based on expert forensic feedback, including cryptographic data provenance (SHA-256 hashing), XXE-safe fail-closed XML parsing, air-gap namespace verification, True offline Geo-IP/ASN resolution (DB-IP/MaxMind), ML benchmarking with hard negatives, and evidence-based clustering tiers. See [Hardening Changelog](#7-hardening-changelog-v20) for details.
+> **Security & Forensic Hardening Notice (v2.0):** This release implements enterprise-grade security upgrades including cryptographic data provenance (SHA-256 hashing), XXE-safe fail-closed XML parsing, offline Geo-IP/ASN resolution (DB-IP/MaxMind), evidence-based clustering tiers, and an ML evaluation harness with hard negatives and rules-only baseline comparison. The IsolationForest model does not yet meet its own quality thresholds — see [Known Limitations](#known-limitations) for current numbers and next steps.
 
 ---
 
@@ -33,10 +33,10 @@ MITHYA addresses the core challenges of crypto-investigations:
 | **Change-Address Detection** | 5-factor heuristic (script-type match, unrounded remainder, decimal precision, novelty, asymmetry) links change outputs back to sender entity. |
 | **Behavioral ML** | 18 engineered features fed into `IsolationForest` to generate an objective **Anomaly Deviation Score** and **Investigative Priority Index**. |
 | **Evidence-Based Clustering** | NetworkX nodes are grouped into Evidence-Based Confidence Tiers (*High-Confidence*, *Mixer-Affected*, *Heuristic/Inferred*). |
-| **ML Validation Suite** | Dedicated `evaluate_model.py` with strict Train/Validation/Test splits benchmarking against rules-only baselines and hard negatives. |
+| **ML Validation Suite** | Dedicated `evaluate_model.py` with strict Train/Validation/Test splits benchmarking against rules-only baselines and hard negatives. See [Known Limitations](#known-limitations) for current results. |
 | **Cryptographic Provenance** | Ingested files are hashed in-memory (SHA-256). Exported dossiers include the source file hash, ingestion timestamp, and model version. |
 | **XXE-Safe XML Ingestion** | `defusedxml` replaces stdlib `xml.etree` — fail-closed architecture prevents billion-laughs and XXE injection attacks. |
-| **Air-Gap Verification** | `scripts/test_airgap.sh` cryptographically isolates and proves 100% offline execution via Linux network namespaces (`unshare -r -n`). |
+| **Air-Gap Design** | `scripts/test_airgap.sh` tests offline execution via Linux network namespaces (`unshare -r -n`). Network isolation is confirmed; see [Known Limitations](#known-limitations) for test suite status. |
 | **Offline Geo-ASN Enrichment** | Local offline DB-IP / MaxMind Lite integration (`geo_asn.py`) resolves IPs to real Autonomous System Numbers with no data fabrication. |
 | **Forensic Disclaimers** | Persistent warning banners on all network-telemetry views: "Not absolute identity attribution (Subject to VPN/NAT/Tor limits)." |
 | **Advanced 4-Tab UI** | Streamlit dashboard: Overview, Entity Attribution (+ASN column), PyVis Graph, Analytical Explainability Panel. |
@@ -141,10 +141,12 @@ A dedicated evaluation harness producing forensic-grade metrics:
 - The `benign_traffic` generator incorporates **hard negatives** (verified exchanges, mining pools, multi-sig treasuries) to robustly stress-test the model's false positive rate against institutional patterns.
 - Output metrics include **hardware telemetry** (Median Processing Time, Peak Memory Usage) tailored for a 16GB RAM environment.
 - F1-Score benchmarking is measured against a deterministic **rules-only baseline classifier**.
+- **Current status:** The model does not yet pass its own quality thresholds. See [Known Limitations](#known-limitations) for actual numbers.
 
-### Phase 2: Security & Air-Gap Proof
-- **XML Parsing Hardening (`transaction_adapter.py`)**: `BitcoinXMLAdapter` now strictly uses `defusedxml` in a fail-closed architecture, completely removing fallbacks to standard `xml.etree`. This protects against XXE (XML External Entity) injections and Billion-Laughs attacks.
-- **Air-Gap Verification (`scripts/test_airgap.sh`)**: We cryptographically isolate and prove 100% offline execution utilizing Linux network namespaces (`unshare -r -n`), demonstrating zero external dependencies or telemetry callbacks during analysis.
+### Phase 2: Security & Air-Gap
+- **XML Parsing Hardening (`transaction_adapter.py`)**: `BitcoinXMLAdapter` uses `defusedxml` in a fail-closed architecture (lazy-loaded so CSV/JSON adapters still work without it). This protects against XXE (XML External Entity) injections and Billion-Laughs attacks.
+- **Air-Gap Testing (`scripts/test_airgap.sh`)**: Tests offline execution inside Linux network namespaces (`unshare -r -n`). The script probes for the available namespace mode first, then runs the inner test suite exactly once. Network isolation is confirmed working; see [Known Limitations](#known-limitations) for the overall test suite status.
+- **Upload Size Limits (`transaction_adapter.py`)**: All adapters enforce configurable file-size and row-count limits (via `MITHYA_MAX_FILE_SIZE_MB` and `MITHYA_MAX_ROWS` env vars) to prevent memory exhaustion from oversized uploads.
 
 ### Phase 3: Cryptographic Data Provenance (`app.py`)
 - Ingested files (.csv, .json, .xml) are dynamically hashed in memory upon upload using `hashlib.sha256`.
@@ -255,6 +257,40 @@ bash scripts/test_airgap.sh --verbose
 ```bash
 pytest tests/ -v
 ```
+
+---
+
+## Known Limitations
+
+The following are honest, current-state limitations. Run the commands shown to reproduce these numbers.
+
+### ML Model Performance (`python evaluate_model.py --records 400`)
+
+The IsolationForest model **does not currently pass its own quality thresholds** (OVERALL: FAIL). Actual numbers from `evaluate_model.py --records 400`:
+
+| Dataset | Precision | Recall | F1 | FPR |
+|---------|-----------|--------|----|-----|
+| UNIFIED (known threats) | 0.00 | 0.00 | 0.00 | 0.90 |
+| UNIFIED NOVEL (novel threats) | 0.75 | 1.00 | 0.85 | 0.85 |
+| **Aggregate** | **0.37** | **0.50** | **0.43** | **0.88** |
+| Pass thresholds | ≥0.70 | ≥0.65 | ≥0.65 | ≤0.20 |
+
+The rules-only baseline (F1 0.89–0.98) currently outperforms the ML model. The model detects novel/unseen threat patterns well (F1 0.85) but fails on known threat types that are too similar to normal traffic in the current feature space. The high FPR (~88%) indicates the model has not learned a tight enough "normal" boundary.
+
+**Root causes under investigation:**
+- The 21 engineered features don't separate known attack patterns (peel chains, structuring) from benign traffic strongly enough for unsupervised detection.
+- IsolationForest by design cannot replicate the explicit pattern-matching that makes the rules baseline effective on known threat types.
+
+**Planned next steps:** Feature engineering targeting known threat signatures, contamination parameter tuning, and potentially a hybrid approach (rules for known patterns, IF for novel/unknown threats).
+
+### Air-Gap Test Suite (`bash scripts/test_airgap.sh`)
+
+- **Network isolation works correctly** — external connectivity is blocked inside the namespace.
+- **5 of 7 test steps pass** — the 2 failures are: (1) `test_heuristics.py` has a pre-existing import error (`extract_network_features`), and (2) `evaluate_model.py` returns exit code 3 (FAIL verdict, not a crash). Neither failure is related to air-gap isolation itself.
+
+### Test Suite (`python -m pytest tests/`)
+
+- `tests/test_heuristics.py` has a pre-existing `ImportError` (`cannot import name 'extract_network_features' from 'features'`). All other test files pass (47 tests).
 
 ---
 

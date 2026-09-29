@@ -85,16 +85,26 @@ import os
 # expansion attacks (billion laughs, external entity injection, etc.).
 # Reference: https://pypi.org/project/defusedxml/
 #
-# SECURITY POLICY: If defusedxml is not installed, we FAIL CLOSED.
-# There is NO fallback to the vulnerable stdlib xml.etree.ElementTree.
+# SECURITY POLICY: If defusedxml is not installed, we FAIL CLOSED when
+# XML parsing is actually attempted.  CSV/JSON adapters do NOT require
+# defusedxml and should continue to work without it.
 try:
     import defusedxml.ElementTree as ET
+    _DEFUSEDXML_AVAILABLE = True
 except ImportError:
-    raise RuntimeError(
-        "[SECURITY] defusedxml is REQUIRED but not installed. "
-        "The MITHYA prototype refuses to parse XML without XXE protection. "
-        "Install with: pip install defusedxml"
-    )
+    _DEFUSEDXML_AVAILABLE = False
+
+    class _DefusedXmlUnavailable:
+        """Lazy proxy that raises a clear security error on first use."""
+
+        def __getattr__(self, name):
+            raise RuntimeError(
+                "[SECURITY] defusedxml is REQUIRED to parse XML uploads but is "
+                "not installed. Refusing to fall back to the unsafe stdlib "
+                "xml.etree.ElementTree. Install with: pip install defusedxml"
+            )
+
+    ET = _DefusedXmlUnavailable()  # type: ignore[assignment]
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -123,6 +133,62 @@ CANONICAL_COLUMNS: List[str] = [
     "fee",
     "src_port",
 ]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UPLOAD SIZE / ROW-COUNT LIMITS
+# ═══════════════════════════════════════════════════════════════════════════
+# Configurable via environment variables.  Tests can also monkeypatch the
+# module globals at runtime (the helpers use `if x is None: x = GLOBAL`
+# rather than default-argument binding so patches take effect immediately).
+
+MAX_UPLOAD_FILE_SIZE_BYTES: int = (
+    int(os.environ.get("MITHYA_MAX_FILE_SIZE_MB", "200")) * 1024 * 1024
+)
+MAX_UPLOAD_ROWS: int = int(os.environ.get("MITHYA_MAX_ROWS", "2000000"))
+
+
+def _validate_file_size(
+    path_or_buffer: str | os.PathLike,
+    max_bytes: int | None = None,
+) -> None:
+    """Raise ``ValueError`` if the file is larger than *max_bytes*.
+
+    Checked **before** any parsing takes place so that an oversized file
+    never gets loaded into memory at all.
+    """
+    if max_bytes is None:
+        max_bytes = MAX_UPLOAD_FILE_SIZE_BYTES
+    try:
+        size = os.path.getsize(path_or_buffer)
+    except OSError:
+        return  # non-seekable / in-memory buffer → skip check
+    if size > max_bytes:
+        mb = size / (1024 * 1024)
+        limit_mb = max_bytes / (1024 * 1024)
+        raise ValueError(
+            f"File is too large ({mb:.1f} MB). "
+            f"Maximum allowed size is {limit_mb:.1f} MB. "
+            f"Set the MITHYA_MAX_FILE_SIZE_MB environment variable to raise this limit."
+        )
+
+
+def _validate_row_count(
+    df: pd.DataFrame,
+    max_rows: int | None = None,
+) -> None:
+    """Raise ``ValueError`` if *df* has more rows than *max_rows*.
+
+    Checked **after** the DataFrame is built so that row-inflated files
+    (e.g. a small file that expands into millions of rows) are caught.
+    """
+    if max_rows is None:
+        max_rows = MAX_UPLOAD_ROWS
+    if len(df) > max_rows:
+        raise ValueError(
+            f"File contains too many rows ({len(df):,}). "
+            f"Maximum allowed is {max_rows:,}. "
+            f"Set the MITHYA_MAX_ROWS environment variable to raise this limit."
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -470,6 +536,7 @@ class BitcoinCSVAdapter(BaseTransactionAdapter):
             )
 
         logger.info("[%s/CSV] Loading file: %s", self.CHAIN_NAME, filepath)
+        _validate_file_size(filepath)
 
         try:
             df = pd.read_csv(filepath)
@@ -484,6 +551,8 @@ class BitcoinCSVAdapter(BaseTransactionAdapter):
                 "[%s/CSV] File '%s' parsed successfully but contains "
                 "0 rows.", self.CHAIN_NAME, filepath,
             )
+
+        _validate_row_count(df)
 
         logger.info(
             "[%s/CSV] Loaded %d transactions with columns: %s",
@@ -635,6 +704,7 @@ class BitcoinJSONAdapter(BaseTransactionAdapter):
             )
 
         logger.info("[%s/JSON] Loading file: %s", self.CHAIN_NAME, filepath)
+        _validate_file_size(filepath)
 
         try:
             with open(filepath, "r", encoding="utf-8") as fh:
@@ -659,6 +729,7 @@ class BitcoinJSONAdapter(BaseTransactionAdapter):
             )
 
         df = pd.DataFrame(records)
+        _validate_row_count(df)
 
         logger.info(
             "[%s/JSON] Loaded %d transactions with columns: %s",
@@ -895,6 +966,7 @@ class BitcoinXMLAdapter(BaseTransactionAdapter):
             )
 
         logger.info("[%s/XML] Loading file: %s", self.CHAIN_NAME, filepath)
+        _validate_file_size(filepath)
 
         try:
             tree = ET.parse(filepath)
@@ -914,6 +986,7 @@ class BitcoinXMLAdapter(BaseTransactionAdapter):
             )
 
         df = pd.DataFrame(records)
+        _validate_row_count(df)
 
         logger.info(
             "[%s/XML] Loaded %d transactions with columns: %s",

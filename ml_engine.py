@@ -844,7 +844,43 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 # 4. MODEL TRAINING & PREDICTION
 # ═══════════════════════════════════════════════════════════════════════════
 
+def select_informative_features(
+    features: pd.DataFrame, min_std: float = 1e-9,
+) -> pd.DataFrame:
+    """Drop near-zero-variance columns before model fit/predict.
+
+    Returns a copy with only columns whose ``std() > min_std``.
+    Constant (zero-variance) features add noise to IsolationForest
+    without contributing discriminative signal.
+
+    Parameters
+    ----------
+    features : pd.DataFrame
+        The full engineered feature matrix.
+    min_std : float
+        Minimum standard deviation a column must exceed to be kept.
+
+    Returns
+    -------
+    pd.DataFrame
+        Subset of *features* containing only informative columns.
+    """
+    stds = features.std(numeric_only=True)
+    keep_cols = stds[stds > min_std].index.tolist()
+    dropped = [c for c in features.columns if c not in keep_cols]
+    if dropped:
+        _log(
+            f"[*] Excluding {len(dropped)} zero-variance feature(s) from "
+            f"model training (kept in the reported feature table): {dropped}"
+        )
+    return features[keep_cols]
+
+
 def train_model(features: pd.DataFrame, contamination: float = CONTAMINATION) -> Tuple[IsolationForest, np.ndarray, np.ndarray]:
+    # Filter to informative features for model fit/predict only.
+    # The full `features` DataFrame is still returned/used elsewhere
+    # (explanations, Heuristics Inspector UI, dataset-profile display).
+    model_features = select_informative_features(features)
     _log(f"[*] Training IsolationForest (n_estimators=200, contamination={contamination}) …")
     model = IsolationForest(
         n_estimators=200,
@@ -853,9 +889,9 @@ def train_model(features: pd.DataFrame, contamination: float = CONTAMINATION) ->
         random_state=42,
         n_jobs=1
     )
-    model.fit(features)
-    predictions = model.predict(features)
-    raw_scores = model.decision_function(features)
+    model.fit(model_features)
+    predictions = model.predict(model_features)
+    raw_scores = model.decision_function(model_features)
     
     num_anomalies = (predictions == -1).sum()
     _log(f"[*] Flagged {num_anomalies} transactions as anomalies ({num_anomalies / len(features) * 100:.1f}%)")

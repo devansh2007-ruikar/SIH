@@ -352,24 +352,27 @@ sed -i "s|__SKIP_STREAMLIT__|${SKIP_STREAMLIT}|g" "$INNER_SCRIPT"
 sed -i "s|__VERBOSE__|${VERBOSE}|g" "$INNER_SCRIPT"
 chmod +x "$INNER_SCRIPT"
 
-# ── Execute inside a new user + network namespace ────────────────────────────
-echo -e "${YELLOW}[*] Spawning network-isolated namespace via 'unshare -r -n'...${RESET}"
-echo -e "    (all external TCP/UDP will fail inside this namespace)"
-echo -e ""
+# ── Probe which unshare mode is usable on this machine ───────────────────
+# We test each mode with a no-op (`true`) so that the inner test suite is
+# never run more than once.  This prevents conflating "unshare capability
+# missing" with "tests actually failed" and avoids doubling runtime.
+echo -e "${YELLOW}[*] Probing available namespace modes...${RESET}"
 
-# Use -r -n (map root in user namespace + new network namespace)
-# This is the recommended approach for Arch Linux (unprivileged user namespaces
-# are enabled by default).
-if unshare -r -n bash "$INNER_SCRIPT"; then
-    true
-elif unshare --net --user --map-root-user bash "$INNER_SCRIPT"; then
-    # Fallback for older util-linux versions
-    true
-elif unshare --net bash "$INNER_SCRIPT"; then
-    # Last resort (may require root)
-    true
+if unshare -r -n true 2>/dev/null; then
+    UNSHARE_MODE="user-r"
+    UNSHARE_CMD=(unshare -r -n)
+    echo -e "    ${GREEN}[OK]${RESET} unshare -r -n (user + network namespace)"
+elif unshare --net --user --map-root-user true 2>/dev/null; then
+    UNSHARE_MODE="user-long"
+    UNSHARE_CMD=(unshare --net --user --map-root-user)
+    echo -e "    ${GREEN}[OK]${RESET} unshare --net --user --map-root-user"
+elif unshare --net true 2>/dev/null; then
+    UNSHARE_MODE="root"
+    UNSHARE_CMD=(unshare --net)
+    echo -e "    ${GREEN}[OK]${RESET} unshare --net (may require root)"
 else
-    echo -e "${RED}[!] 'unshare' failed. Possible fixes:${RESET}"
+    echo -e "${RED}[!] Neither unshare mode is usable on this system.${RESET}"
+    echo -e "${YELLOW}    Possible fixes:${RESET}"
     echo -e "${YELLOW}    1. Enable unprivileged user namespaces:${RESET}"
     echo -e "       sudo sysctl kernel.unprivileged_userns_clone=1"
     echo -e "${YELLOW}    2. On Arch Linux, check:${RESET}"
@@ -377,3 +380,14 @@ else
     echo -e "${YELLOW}    3. Or run this script with sudo.${RESET}"
     exit 2
 fi
+
+# ── Execute inside the confirmed namespace (exactly once) ────────────────
+echo -e ""
+echo -e "${YELLOW}[*] Spawning network-isolated namespace via '${UNSHARE_CMD[*]}'...${RESET}"
+echo -e "    (all external TCP/UDP will fail inside this namespace)"
+echo -e ""
+
+INNER_EXIT=0
+"${UNSHARE_CMD[@]}" bash "$INNER_SCRIPT" || INNER_EXIT=$?
+
+exit "$INNER_EXIT"

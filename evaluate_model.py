@@ -761,7 +761,7 @@ def _fmt_metric(name: str, value: float) -> str:
     return _c(f"  {value:.4f}  [{marker}]  threshold: {thresh:.2f}", colour)
 
 
-def print_report(results: List[Dict], verbose: bool = False) -> None:
+def print_report(results: List[Dict], verbose: bool = False) -> bool:
     width = 72
     print()
     print(_c("=" * width, _BLUE))
@@ -827,6 +827,7 @@ def print_report(results: List[Dict], verbose: bool = False) -> None:
         print()
         print(_c(f"  {verdict}", colour + _BOLD))
     else:
+        passed = False
         print(_c("  [!] No valid mixed-class results to aggregate.", _YELLOW))
 
     print(_c("=" * width, _BLUE))
@@ -840,6 +841,7 @@ def print_report(results: List[Dict], verbose: bool = False) -> None:
         _YELLOW,
     ))
     print()
+    return passed
 
 
 # ============================================================================
@@ -979,7 +981,7 @@ def _get_hardware_info() -> Dict[str, str]:
 # MAIN
 # ============================================================================
 
-def main(args: argparse.Namespace) -> None:
+def main(args: argparse.Namespace) -> int:
     n             = args.records
     contamination = args.contamination
     verbose       = args.verbose
@@ -1029,8 +1031,13 @@ def main(args: argparse.Namespace) -> None:
     X_hard_val     = build_features(hard_val)
     X_hard_test    = build_features(hard_negatives_test)
 
-    # Training corpus: benign_train + known_train (+ hard hard negatives awareness)
-    X_train = pd.concat([X_benign_train, X_known_train], ignore_index=True)
+    # Training corpus: benign + hard negatives ONLY.
+    # IsolationForest is unsupervised — it assumes the training set is mostly
+    # normal.  Including known_train (100% labeled attacks) broke that
+    # assumption and caused the model to badly underperform the rules baseline.
+    # Hard negatives are legitimate traffic that merely *looks* attack-like,
+    # so they strengthen the "normal" boundary without poisoning it.
+    X_train = pd.concat([X_benign_train, X_hard_train], ignore_index=True)
 
     # Align columns across all feature frames (including hard negatives + unified)
     all_cols = sorted(
@@ -1208,7 +1215,7 @@ def main(args: argparse.Namespace) -> None:
     ))
 
     # ── Print report ─────────────────────────────────────────────────
-    print_report(results, verbose=verbose)
+    passed = print_report(results, verbose=verbose)
 
     # ── Validation summary ───────────────────────────────────────────
     width = 72
@@ -1261,6 +1268,10 @@ def main(args: argparse.Namespace) -> None:
     print(_c("=" * width, _BLUE))
     print()
 
+    # Exit code: 0 = thresholds met, 3 = ran to completion but failed
+    # thresholds (distinct from 1 which signals a crash / unhandled error).
+    return 0 if passed else 3
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1283,5 +1294,5 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    main(parse_args())
+    sys.exit(main(parse_args()))
 

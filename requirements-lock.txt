@@ -1,7 +1,20 @@
+# MITHYA — Pinned direct dependencies (regenerated via pip freeze).
+# Install with:  pip install -r requirements-lock.txt
+
 pandas==3.0.5
 numpy==2.5.2
 scikit-learn==1.9.0
 networkx==3.6.1
 pyvis==0.3.2
 streamlit==1.62.0
-pytest==8.3.3
+matplotlib==3.11.1
+Faker==40.37.0
+requests==2.34.2
+pytest==9.1.1
+geoip2==5.3.0
+maxminddb==3.1.1
+
+# SECURITY-CRITICAL — defusedxml is required for safe XML parsing.
+# Without it, XML upload handling fails closed.  Do NOT remove or
+# make this dependency optional.
+defusedxml==0.7.1
