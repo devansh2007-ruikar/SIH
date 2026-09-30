@@ -1,0 +1,9 @@
+address,entity_name,risk_override
+1NDyJtNTjmwk5xPNhjgAMu4HDHigtobu1s,Binance_HotWallet,0.0
+1BinanceHotXyz,Binance_HotWallet,0.0
+3Kzh9qAqVWQhEsfQz7zEQL1EuSx5tyNLsy,Coinbase_ColdStorage,0.0
+3CoinbaseCold123,Coinbase_ColdStorage,0.0
+1F2PoolMiningXyz,F2Pool_Mining,0.0
+bc1qF2PoolReward,F2Pool_Mining,0.0
+bc1qKrakenSweepXyz,Kraken_Sweep,0.0
+3KrakenDeposit,Kraken_Sweep,0.0

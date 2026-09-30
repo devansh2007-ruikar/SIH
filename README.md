@@ -72,7 +72,7 @@ MITHYA addresses the core challenges of crypto-investigations:
 
 **Data Flow:**
 1. `transaction_adapter.py` ingests files via the appropriate adapter; XML is parsed with `defusedxml` (XXE-safe). Ingested files are hashed in memory using `hashlib.sha256`.
-2. `ml_engine.py` builds a NetworkX graph, filters mixers, clusters wallets into Evidence-Based Tiers, engineers 18 features, trains `IsolationForest`, and returns `(enriched_df, model, features_df)`.
+2. `ml_engine.py` builds a NetworkX graph, filters mixers, clusters wallets into Evidence-Based Tiers, engineers 21 features, trains `IsolationForest`, and returns `(enriched_df, model, features_df)`.
 3. `geo_asn.py` enriches the result with offline DB-IP `geo_country` + `asn` fields (zero network I/O, strictly offline).
 4. `app.py` displays results with forensic disclaimers, cluster confidence labels, the `asn` column, and Court-Ready Evidence Dossiers.
 5. `evaluate_model.py` independently benchmarks the model against baselines using a strict Train/Validation/Test setup.
