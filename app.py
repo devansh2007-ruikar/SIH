@@ -154,12 +154,15 @@ THEME_DARK = {
 }
 
 # Initialise theme state (default = light)
-if "theme" not in st.session_state:
-    st.session_state.theme = "light"
+if "dark_mode" not in st.session_state:
+    st.session_state["dark_mode"] = False
+
+def toggle_theme():
+    st.session_state["dark_mode"] = st.session_state["theme_switch"]
 
 
 def _get_palette() -> dict:
-    return THEME_DARK if st.session_state.theme == "dark" else THEME_LIGHT
+    return THEME_DARK if st.session_state.get("dark_mode", False) else THEME_LIGHT
 
 
 def _build_css(p: dict) -> str:
@@ -572,10 +575,12 @@ def _display_geo(value, kind="geo"):
 
 with st.sidebar:
     # Dark mode toggle — very first sidebar item
-    is_dark = (st.session_state.theme == "dark")
-    _toggle_label = "Dark Mode 🌙" if is_dark else "Light Mode ☀️"
-    new_is_dark = st.toggle(_toggle_label, value=is_dark)
-    st.session_state.theme = "dark" if new_is_dark else "light"
+    dark_mode = st.toggle(
+        "🌙 Dark Mode" if st.session_state["dark_mode"] else "☀️ Light Mode",
+        value=st.session_state["dark_mode"],
+        key="theme_switch",
+        on_change=toggle_theme
+    )
     # Re-inject CSS after toggle change
     _inject_theme_css()
     p = _get_palette()
