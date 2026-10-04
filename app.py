@@ -711,7 +711,7 @@ with st.sidebar:
         help="Fraction of transactions that are threat vectors.",
     )
 
-    if st.button("🔄 Regenerate Data", use_container_width=True, type="primary"):
+    if st.button("🔄 Regenerate Data", width="stretch", type="primary"):
         with st.spinner("Generating synthetic data..."):
             result = subprocess.run(
                 [
@@ -740,7 +740,7 @@ with st.sidebar:
                     {"Address": addr, "Institution": wl_labels.get(addr, "Unknown")}
                     for addr in sorted(wl_addrs)
                 ])
-                st.dataframe(wl_display, hide_index=True, use_container_width=True)
+                st.dataframe(wl_display, hide_index=True, width="stretch")
             else:
                 st.info("No whitelist loaded.")
         except Exception:
@@ -760,7 +760,7 @@ with st.sidebar:
                         "Severity": e.get("severity", 0.0),
                     })
             if all_entries:
-                st.dataframe(pd.DataFrame(all_entries), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(all_entries), hide_index=True, width="stretch")
             else:
                 st.info("No watchlist loaded.")
         except Exception:
@@ -804,6 +804,9 @@ if uploaded_watchlist is not None:
 
 def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
     """Run the full AI pipeline via the polymorphic adapter, then enrich with offline Geo-ASN."""
+    import time
+    _t_start = time.perf_counter()
+
     if "geo_country" not in raw_df.columns:
         raw_df["geo_country"] = "XX"
     if hasattr(adapter, "REQUIRED_COLUMNS"):
@@ -825,6 +828,10 @@ def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
             enriched_df, _ = clustering.apply_clustering_to_transactions(enriched_df, features)
         except Exception as _cl_err:
             pass
+
+    _elapsed = time.perf_counter() - _t_start
+    st.session_state["pipeline_elapsed_s"] = _elapsed
+    st.session_state["pipeline_tx_count"] = len(enriched_df)
 
     return enriched_df, features
 
@@ -1053,6 +1060,10 @@ _MITHYA_SVG_LOGO = f"""
 </svg>
 """
 
+_proc_seconds = float(st.session_state.get("pipeline_elapsed_s", 1.2))
+_proc_n = int(st.session_state.get("pipeline_tx_count", total_tx))
+_proc_text = f"Processed {_proc_n} tx in {_proc_seconds:.1f}s"
+
 st.markdown(
     f"""
 <div class="mithya-header">
@@ -1066,6 +1077,7 @@ st.markdown(
 <div class="mithya-header-badges">
 <span class="mithya-pill">🟢 Offline</span>
 <span class="mithya-pill">🔒 Air-Gapped</span>
+<span class="mithya-pill">{_proc_text}</span>
 <span class="mithya-pill">SIH 2026</span>
 </div>
 </div>
@@ -1074,16 +1086,16 @@ st.markdown(
 )
 
 if data_source == "uploaded_separate":
-    source_label = f"📂 Live analysis of uploaded separate files (telemetry + blockchain) ({total_tx} tx)"
+    source_label = f"📂 Live analysis of uploaded separate files (telemetry + blockchain) — {_proc_text}"
     source_color = "#22c55e"
 elif data_source == "uploaded":
-    source_label = f"📂 Live analysis of uploaded file ({total_tx} tx)"
+    source_label = f"📂 Live analysis of uploaded file — {_proc_text}"
     source_color = "#22c55e"
 elif data_source == "default_separate":
-    source_label = f"💾 Default correlated dataset: network_telemetry.csv + blockchain_tx.csv ({total_tx} tx)"
+    source_label = f"💾 Default correlated dataset: network_telemetry.csv + blockchain_tx.csv — {_proc_text}"
     source_color = "#3b82f6"
 else:
-    source_label = f"💾 Default dataset: {_default_path} ({total_tx} tx)"
+    source_label = f"💾 Default dataset: {_default_path} — {_proc_text}"
     source_color = "#3b82f6"
 
 st.markdown(
@@ -1146,7 +1158,7 @@ with st.expander("🧾 Ingestion Report", expanded=False):
             {"Reason": k.replace("_", " ").title(), "Count": int(v)}
             for k, v in _reasons.items() if v > 0
         ]
-        st.dataframe(pd.DataFrame(reasons_list), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(reasons_list), width="stretch", hide_index=True)
     else:
         st.caption("✅ All rows passed schema and structural integrity checks (0 rejections).")
 
@@ -1294,7 +1306,7 @@ with tab1:
                 x=alt.X("Detected Pattern:N", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], labelAngle=-30)),
                 y=alt.Y("Count:Q", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], gridColor=_cp["chart_grid"])),
             ).properties(height=300).configure(background=_cp["chart_bg"]).configure_view(strokeWidth=0)
-            st.altair_chart(chart1, use_container_width=True)
+            st.altair_chart(chart1, width="stretch")
 
     with col_chart2:
         st.markdown(
@@ -1326,7 +1338,7 @@ with tab1:
                 color=alt.Color("Group:N", scale=_color_scale, legend=alt.Legend(title="Group", labelColor=_cp["chart_text"], titleColor=_cp["chart_text"])),
                 order=alt.Order("Group:N", sort="descending"),
             ).properties(height=300).configure(background=_cp["chart_bg"]).configure_view(strokeWidth=0)
-            st.altair_chart(chart2, use_container_width=True)
+            st.altair_chart(chart2, width="stretch")
         else:
             st.info("No data to display.")
 
@@ -1521,7 +1533,7 @@ with tab1:
             data=pdf_bytes,
             file_name=f"mithya_forensic_dossier_{case_id}.pdf",
             mime="application/pdf",
-            use_container_width=True,
+            width="stretch",
         )
 
     with btn_col2:
@@ -1530,7 +1542,7 @@ with tab1:
             data=json_bytes,
             file_name=f"mithya_forensic_dossier_{case_id}.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
         )
 
     with btn_col3:
@@ -1539,7 +1551,7 @@ with tab1:
             data=report_text.encode("utf-8"),
             file_name=f"mithya_forensic_report_{case_id}.txt",
             mime="text/plain",
-            use_container_width=True,
+            width="stretch",
         )
 
     with btn_col4:
@@ -1549,7 +1561,7 @@ with tab1:
             data=sidecar_text.encode("utf-8"),
             file_name=f"mithya_forensic_dossier_{case_id}.pdf.sha256",
             mime="text/plain",
-            use_container_width=True,
+            width="stretch",
         )
 
     # Full Results CSV
@@ -1560,7 +1572,7 @@ with tab1:
         data=csv_export,
         file_name="mithya_full_results.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -1756,7 +1768,7 @@ with tab2:
     styled_df = _styler
     st.dataframe(
         styled_df,
-        use_container_width=True,
+        width="stretch",
         height=520,
         hide_index=True,
     )
@@ -1770,7 +1782,7 @@ with tab2:
             data=view_df.to_csv(index=False).encode("utf-8"),
             file_name="mithya_filtered.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -1910,23 +1922,19 @@ with tab3:
         if "entity_id" in anom_rows.columns:
             anom_entities = set(anom_rows["entity_id"].unique())
 
-        normal_rows = graph_df[(graph_df["is_anomaly"] == False) & ~graph_df["explanation"].str.contains("Regulated", na=False)]
-        ip_mask = normal_rows["src_ip"].isin(anom_ips)
-        entity_mask = (
-            normal_rows["entity_id"].isin(anom_entities)
-            if "entity_id" in normal_rows.columns
-            else pd.Series(False, index=normal_rows.index)
-        )
-        context_candidates = normal_rows[ip_mask | entity_mask]
-        context_rows = context_candidates.sort_values("risk_score", ascending=False).head(MAX_CONTEXT_NORMAL)
-
-        if not threats_only_mode:
-            already_selected = set(context_rows.index)
-            clean_pool = normal_rows[~normal_rows.index.isin(already_selected)]
-            clean_sample = clean_pool.sample(n=min(MAX_CLEAN_SAMPLE, len(clean_pool)), random_state=42)
-            plot_df = pd.concat([anom_rows, wl_rows, regulated_rows.head(10), context_rows, clean_sample]).drop_duplicates()
+        if target_entity == "View Full Graph":
+            plot_df = graph_df.sort_values("risk_score", ascending=False).head(400)
         else:
-            plot_df = pd.concat([anom_rows, wl_rows, context_rows]).drop_duplicates()
+            ent_rows = graph_df[graph_df["entity_id"] == target_entity]
+            ent_ips = set(ent_rows["src_ip"].dropna().unique())
+            rel_rows = graph_df[graph_df["src_ip"].isin(ent_ips) | (graph_df["entity_id"] == target_entity)]
+            plot_df = rel_rows.sort_values("risk_score", ascending=False).head(400)
+
+        anom_rows = graph_df[graph_df["is_anomaly"] == True]
+        anom_ips = set(anom_rows["src_ip"].unique())
+        anom_entities = set()
+        if "entity_id" in anom_rows.columns:
+            anom_entities = set(anom_rows["entity_id"].dropna().unique())
 
         import networkx as nx
         temp_nx = nx.DiGraph()
@@ -2066,6 +2074,9 @@ with tab3:
         with open(tmp.name, "r") as f:
             html_content = f.read()
         return html_content
+
+    if target_entity == "View Full Graph":
+        st.info(f"Showing top 400 of {len(df)}; use Isolate Target Entity for more")
 
     st.markdown('<div class="graph-container">', unsafe_allow_html=True)
     graph_html = build_network_graph(df, threats_only_mode=threats_only, target_entity=target_entity)
@@ -2291,7 +2302,7 @@ with tab4:
             (_bd_chart + _bd_text).configure(
                 background=_dp.get("chart_bg", "transparent")
             ).configure_view(strokeWidth=0),
-            use_container_width=True,
+            width="stretch",
         )
 
         # ── Top Feature Deviations chart ──
@@ -2336,7 +2347,7 @@ with tab4:
                             (_dev_chart + _dev_text).configure(
                                 background=_dp.get("chart_bg", "transparent")
                             ).configure_view(strokeWidth=0),
-                            use_container_width=True,
+                            width="stretch",
                         )
             except Exception:
                 pass  # Fall through to telemetry table
@@ -2485,7 +2496,7 @@ with tab4:
                 _timeline_chart.configure(
                     background=_dp.get("chart_bg", "transparent")
                 ).configure_view(strokeWidth=0),
-                use_container_width=True,
+                width="stretch",
             )
 
             # ── Hop Table ──
@@ -2503,7 +2514,7 @@ with tab4:
                 }
                 for h in hops_data
             ]
-            st.dataframe(pd.DataFrame(_hop_table_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_hop_table_rows), width="stretch", hide_index=True)
 
             # ── Small PyVis Graph of Only the Path ──
             # with the selected tx in red and the endpoint in green
@@ -2603,7 +2614,7 @@ with tab4:
                 amt = in_amounts[i] if i < len(in_amounts) else 0.0
                 in_data.append({"Address": addr.strip(), "Amount (BTC)": f"{amt:.8f}"})
             if in_data:
-                st.dataframe(pd.DataFrame(in_data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(in_data), hide_index=True, width="stretch")
 
         with addr_col2:
             st.markdown("**Output Addresses & Amounts**")
@@ -2614,7 +2625,7 @@ with tab4:
                 amt = out_amounts[i] if i < len(out_amounts) else 0.0
                 out_data.append({"Address": addr.strip(), "Amount (BTC)": f"{amt:.8f}"})
             if out_data:
-                st.dataframe(pd.DataFrame(out_data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(out_data), hide_index=True, width="stretch")
 
         st.markdown(
             f"""
@@ -2732,7 +2743,7 @@ with tab5:
 
             # ── 2. Hold-out Benchmark Table (4 Methods) ──
             st.markdown(f'<h4 style="color:{_p5["accent"]};margin-top:1rem;margin-bottom:0.4rem;">Hold-Out Evaluation (70/30 Stratified Split)</h4>', unsafe_allow_html=True)
-            st.dataframe(_ho["table"], use_container_width=True, hide_index=True)
+            st.dataframe(_ho["table"], width="stretch", hide_index=True)
 
             # ── 3. Altair ROC curve and PR curve with the 4 methods as coloured lines ──
             _roc_pr_col1, _roc_pr_col2 = st.columns(2)
@@ -2763,7 +2774,7 @@ with tab5:
                     tooltip=["Method:N", alt.Tooltip("FPR:Q", format=".3f"), alt.Tooltip("TPR:Q", format=".3f")],
                 )
                 _roc_chart = (_roc_line + _diag_chart).properties(height=300)
-                st.altair_chart(_roc_chart, use_container_width=True)
+                st.altair_chart(_roc_chart, width="stretch")
 
             # Build PR DataFrame
             _pr_rows = []
@@ -2780,7 +2791,7 @@ with tab5:
                     color=alt.Color("Method:N", scale=alt.Scale(domain=_color_domain, range=_color_range), legend=alt.Legend(orient="bottom", title=None)),
                     tooltip=["Method:N", alt.Tooltip("Recall:Q", format=".3f"), alt.Tooltip("Precision:Q", format=".3f")],
                 )
-                st.altair_chart(_pr_line.properties(height=300), use_container_width=True)
+                st.altair_chart(_pr_line.properties(height=300), width="stretch")
 
             # ── 4. Confusion matrix heatmap and Calibration plot ──
             _cm_cal_col1, _cm_cal_col2 = st.columns(2)
@@ -2807,7 +2818,7 @@ with tab5:
                     text=alt.Text("Count:Q"),
                     color=alt.condition(alt.datum.Count > _max_cnt / 2, alt.value("white"), alt.value("black")),
                 )
-                st.altair_chart((_rect + _text).properties(height=280), use_container_width=True)
+                st.altair_chart((_rect + _text).properties(height=280), width="stretch")
 
             with _cm_cal_col2:
                 st.markdown(f'<p style="font-weight:600;font-size:0.95rem;color:{_p5["text"]};">Calibration Reliability Curve (ECE: {_ho["ece_after"]:.4f})</p>', unsafe_allow_html=True)
@@ -2829,7 +2840,7 @@ with tab5:
                 _cal_diag = alt.Chart(_diag_df).mark_line(
                     strokeDash=[4, 4], color="#94A3B8"
                 ).encode(x="x:Q", y="y:Q")
-                st.altair_chart((_cal_line + _cal_diag).properties(height=280), use_container_width=True)
+                st.altair_chart((_cal_line + _cal_diag).properties(height=280), width="stretch")
 
             # ── 5. Per-Attack-Type Recall and Generalisation Results ──
             _tab5_bottom_col1, _tab5_bottom_col2 = st.columns(2)
@@ -2845,12 +2856,12 @@ with tab5:
                     }
                     for _atk, _rec in _ptr.items()
                 ]
-                st.dataframe(pd.DataFrame(_ptr_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_ptr_rows), width="stretch", hide_index=True)
 
             with _tab5_bottom_col2:
                 st.markdown(f'<p style="font-weight:600;font-size:0.95rem;color:{_p5["text"]};">Generalisation Test (Unseen 1500-Record Dataset, Seed=999)</p>', unsafe_allow_html=True)
                 if _eval_res.get("generalisation") and "table" in _eval_res["generalisation"]:
-                    st.dataframe(_eval_res["generalisation"]["table"], use_container_width=True, hide_index=True)
+                    st.dataframe(_eval_res["generalisation"]["table"], width="stretch", hide_index=True)
                 else:
                     st.info("Generalisation test pending.")
 
@@ -2956,7 +2967,7 @@ with tab6:
         _pca_chart.configure(
             background=_p6.get("chart_bg", "transparent")
         ).configure_view(strokeWidth=0),
-        use_container_width=True,
+        width="stretch",
     )
 
     # ── 2. Cluster Table and Community Table ──
@@ -2967,7 +2978,7 @@ with tab6:
 
     with _tbl_col1:
         st.markdown(f'<h5 style="color:{_p6["text"]};margin-bottom:0.4rem;">Behavioural Clusters Summary</h5>', unsafe_allow_html=True)
-        st.dataframe(_cluster_summary, use_container_width=True, hide_index=True)
+        st.dataframe(_cluster_summary, width="stretch", hide_index=True)
         st.download_button(
             "📥 Download Cluster Table (CSV)",
             data=_cluster_summary.to_csv(index=False),
@@ -2978,7 +2989,7 @@ with tab6:
 
     with _tbl_col2:
         st.markdown(f'<h5 style="color:{_p6["text"]};margin-bottom:0.4rem;">Graph Communities Summary (Louvain)</h5>', unsafe_allow_html=True)
-        st.dataframe(_comm_summary, use_container_width=True, hide_index=True)
+        st.dataframe(_comm_summary, width="stretch", hide_index=True)
         st.download_button(
             "📥 Download Community Table (CSV)",
             data=_comm_summary.to_csv(index=False),

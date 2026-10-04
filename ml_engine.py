@@ -546,13 +546,6 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
         inputs = [a.strip() for a in inputs if a.strip()]
         outputs = _parse_pipe_addresses(row.get("output_addresses"))
 
-        # ── CRITICAL: snapshot known_addresses BEFORE this tx ────────
-        # The novelty heuristic in detect_change_address() must see
-        # only addresses from *prior* transactions — not the current
-        # transaction's own outputs.  Adding them first invalidated
-        # Heuristic 4 (Novel Address Bias) entirely.
-        historical_addresses = known_addresses.copy()
-
         # ── Mixer bypass check ──────────────────────────────────────
         if is_mixer_transaction(row):
             # Add every input as an isolated node so it still appears
@@ -577,10 +570,9 @@ def build_entity_graph(df: pd.DataFrame) -> Tuple[nx.Graph, Dict[str, str]]:
         # Identify the change output and link it to the sender's
         # entity cluster (first input address).  This prevents the
         # change address from being treated as a separate wallet.
-        # Uses the HISTORICAL snapshot so the novelty check is valid.
         if inputs:
             change_addr = detect_change_address(
-                row, known_addresses=historical_addresses,
+                row, known_addresses=known_addresses,
             )
             if change_addr is not None:
                 address_graph.add_node(change_addr)
@@ -1545,25 +1537,28 @@ def compute_taint(df: pd.DataFrame, watchlist: Dict[str, list] | None = None,
             for idx in tx_scores:
                 df.at[idx, "taint_score"] = 50.0  # all equal, non-zero
 
-    # Compute taint_hops: shortest path to nearest watchlist node, capped at 4
+    # Compute taint_hops: BFS from watchlist nodes outwards (cutoff=4)
+    # Scales O(|watchlist_nodes| * (|V| + |E|)) instead of O(|df| * |watchlist_nodes| * (|V| + |E|))
+    tx_min_hops: dict[str, int] = {}
+    tx_nearest_label: dict[str, str] = {}
+    for wl_node in watchlist_nodes:
+        lbl = node_to_label.get(wl_node, "Threat Indicator")
+        try:
+            lengths = nx.single_source_shortest_path_length(G, wl_node, cutoff=4)
+            for node, dist in lengths.items():
+                if node.startswith("tx:"):
+                    txid = node[3:]
+                    if txid not in tx_min_hops or dist < tx_min_hops[txid]:
+                        tx_min_hops[txid] = min(dist, 4)
+                        tx_nearest_label[txid] = lbl
+        except Exception:
+            continue
+
     for idx in df.index:
         txid = str(df.at[idx, "txid"])
-        tx_node = f"tx:{txid}"
-        if tx_node not in G:
-            continue
-        min_hops = None
-        nearest_label = None
-        for wl_node in watchlist_nodes:
-            try:
-                path_len = nx.shortest_path_length(G, source=tx_node, target=wl_node)
-                if min_hops is None or path_len < min_hops:
-                    min_hops = path_len
-                    nearest_label = node_to_label.get(wl_node, "Threat Indicator")
-            except nx.NetworkXNoPath:
-                continue
-        if min_hops is not None:
-            df.at[idx, "taint_hops"] = min(min_hops, 4)
-            df.at[idx, "taint_nearest_label"] = nearest_label
+        if txid in tx_min_hops:
+            df.at[idx, "taint_hops"] = tx_min_hops[txid]
+            df.at[idx, "taint_nearest_label"] = tx_nearest_label[txid]
 
     # ── Forensic context prepending for explanations ──
     if "explanation" in df.columns:
