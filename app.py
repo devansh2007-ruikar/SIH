@@ -858,6 +858,27 @@ def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float, start_time: Opt
     return enriched_df, features
 
 
+@st.cache_data
+def get_traceable_transactions(_df: pd.DataFrame, dataset_id: str) -> list[dict]:
+    """Find up to 20 flagged transactions whose forward trace has >= 2 hops, sorted by fused priority."""
+    import flow_tracer
+    if "is_anomaly" in _df.columns:
+        flagged = _df[_df["is_anomaly"] == True].sort_values("risk_score", ascending=False)
+    else:
+        flagged = _df[_df["risk_score"] >= 60].sort_values("risk_score", ascending=False)
+
+    traceable = []
+    for _, row in flagged.iterrows():
+        txid = str(row["txid"])
+        hops = flow_tracer.trace_forward(_df, txid, max_hops=4)
+        if len(hops) >= 2:
+            label = f"{txid[:12]}... | {row['risk_score']:.1f}% | {row.get('detected_type', 'N/A')} ({len(hops)} hops)"
+            traceable.append({"txid": txid, "label": label, "risk_score": float(row["risk_score"])})
+            if len(traceable) >= 20:
+                break
+    return traceable
+
+
 import hashlib
 
 # Determine data source and load
@@ -1887,9 +1908,18 @@ with tab2:
         lambda v: round(float(v), 1) if pd.notna(v) and str(v) != "nan" else 0.0
     ) if "taint_score" in view_df.columns else 0.0
 
-    view_df["Hops from known-bad"] = view_df["taint_hops"].apply(
-        lambda v: str(int(v)) if pd.notna(v) and v is not None and str(v) not in ("nan", "None", "") else ""
-    ) if "taint_hops" in view_df.columns else ""
+    def _format_hops_display(r):
+        if bool(r.get("watchlist_hit")):
+            return "0 (direct)"
+        v = r.get("taint_hops")
+        if pd.notna(v) and v is not None and str(v).strip() not in ("nan", "None", ""):
+            try:
+                return str(int(float(v)))
+            except (ValueError, TypeError):
+                return str(v)
+        return "—"
+
+    view_df["Hops from known-bad"] = view_df.apply(_format_hops_display, axis=1)
 
     display_cols = [
         "txid", "risk_score", "entity_id", "cluster_confidence", "explanation",
@@ -1999,11 +2029,18 @@ with tab2:
     if "Risk Tier" in display_df.columns:
         _styler = _styler.map(_style_risk_tier, subset=["Risk Tier"])
     styled_df = _styler
+    _suspicious_col_config = {
+        "Hops from known-bad": st.column_config.TextColumn(
+            "Hops from known-bad",
+            help="Shortest graph distance to a watchlist address/IP (max 4)",
+        )
+    }
     st.dataframe(
         styled_df,
         width="stretch",
         height=520,
         hide_index=True,
+        column_config=_suspicious_col_config,
     )
 
     st.markdown('</div>', unsafe_allow_html=True)
@@ -2355,14 +2392,24 @@ with tab4:
     ]
     txid_map = {opt: row["txid"] for opt, (_, row) in zip(tx_options, sorted_df.iterrows())}
 
+    default_tx_index = 0
+    saved_txid = st.session_state.get("selected_txid")
+    if saved_txid:
+        for idx_opt, opt in enumerate(tx_options[:200]):
+            if txid_map.get(opt) == saved_txid:
+                default_tx_index = idx_opt
+                break
+
     selected_tx_label = st.selectbox(
         "Select Transaction",
         tx_options[:200],
+        index=default_tx_index,
         help="Sorted by Investigative Priority Index. Select any transaction to inspect.",
     )
 
     if selected_tx_label:
         selected_txid = txid_map[selected_tx_label]
+        st.session_state["selected_txid"] = selected_txid
         tx_row = df[df["txid"] == selected_txid].iloc[0]
         tx_idx = df[df["txid"] == selected_txid].index[0]
         feat_row = features_df.iloc[tx_idx]
@@ -2630,11 +2677,33 @@ with tab4:
 
         import flow_tracer
 
+        # Jump to a traceable transaction (>= 2 hops)
+        _ds_key = f"{file_hash}_{len(df)}"
+        traceable_list = get_traceable_transactions(df, _ds_key)
+        if traceable_list:
+            jump_options = ["— Select to jump —"] + [t["label"] for t in traceable_list]
+            jump_map = {t["label"]: t["txid"] for t in traceable_list}
+            traceable_ids = [t["txid"] for t in traceable_list]
+            jump_idx = (traceable_ids.index(selected_txid) + 1) if selected_txid in traceable_ids else 0
+
+            chosen_jump = st.selectbox(
+                "Jump to a traceable transaction",
+                jump_options,
+                index=jump_idx,
+                key=f"jump_traceable_{selected_txid}",
+                help="Jump directly to a high-priority flagged transaction with multi-hop fund flow.",
+            )
+            if chosen_jump != "— Select to jump —":
+                target_jump_txid = jump_map[chosen_jump]
+                if target_jump_txid != selected_txid:
+                    st.session_state["selected_txid"] = target_jump_txid
+                    st.rerun()
+
         _ftm_col1, _ftm_col2 = st.columns([1, 1])
         with _ftm_col1:
             trace_direction = st.radio(
                 "Trace Direction",
-                ["Forward", "Backward"],
+                ["Both", "Forward", "Backward"],
                 horizontal=True,
                 key=f"ftm_dir_{selected_txid}",
             )
@@ -2647,27 +2716,45 @@ with tab4:
                 key=f"ftm_hops_{selected_txid}",
             )
 
-        if trace_direction == "Forward":
-            hops_data = flow_tracer.trace_forward(df, selected_txid, max_hops=trace_hops)
-        else:
-            hops_data = flow_tracer.trace_backward(df, selected_txid, max_hops=trace_hops)
+        hop0_fallback = {
+            "hop": 0,
+            "role": "Source",
+            "txid": selected_txid,
+            "timestamp": tx_row.get("timestamp", ""),
+            "delta_t_minutes": 0.0,
+            "btc_in": float(tx_row.get("total_amount_btc", 0.0)),
+            "largest_output_btc": float(tx_row.get("largest_output_btc", 0.0) or tx_row.get("total_amount_btc", 0.0)),
+            "retained_pct": 100.0,
+            "peeled_btc": 0.0,
+        }
 
-        if not hops_data or len(hops_data) <= 1:
-            st.info(f"No downstream spends found within {trace_hops} hops. Try a Peel_Chain transaction.")
-        else:
-            # ── Next Step Box ──
-            last_hop = hops_data[-1]
-            last_role = last_hop.get("role")
-            if last_role == "Exchange endpoint":
-                _ent = last_hop.get("whitelisted_entity") or "regulated exchange"
-                st.success(f"Funds reached {_ent}. Next step: lawful KYC request to this VASP.")
-            elif last_role == "Mixer":
-                st.warning("Trail enters a mixer; further tracing has low confidence.")
+        if trace_direction == "Both":
+            fwd_hops = flow_tracer.trace_forward(df, selected_txid, max_hops=trace_hops)
+            bwd_hops = flow_tracer.trace_backward(df, selected_txid, max_hops=trace_hops)
+            merged_hops_data = [dict(h, hop=-int(h["hop"])) for h in reversed(bwd_hops[1:])] + (fwd_hops if fwd_hops else [hop0_fallback])
+        elif trace_direction == "Forward":
+            fwd_hops = flow_tracer.trace_forward(df, selected_txid, max_hops=trace_hops)
+            bwd_hops = []
+            merged_hops_data = fwd_hops if fwd_hops else [hop0_fallback]
+        else:  # "Backward"
+            fwd_hops = []
+            bwd_hops = flow_tracer.trace_backward(df, selected_txid, max_hops=trace_hops)
+            merged_hops_data = [dict(h, hop=-int(h["hop"])) for h in reversed(bwd_hops[1:])] + (bwd_hops[:1] if bwd_hops else [hop0_fallback])
 
-            # ── Altair Timeline ──
-            # x = timestamp, y = BTC moving at each hop, points coloured by role, tooltip with txid, delta_t and retained_pct
+        # ── Next Step Box (if exchange endpoint or mixer in path) ──
+        _all_hops = (fwd_hops or []) + (bwd_hops or [])
+        _endpoints = [h for h in _all_hops if h.get("role") == "Exchange endpoint" and h.get("txid") != selected_txid]
+        _mixers = [h for h in _all_hops if h.get("role") == "Mixer" and h.get("txid") != selected_txid]
+        if _endpoints:
+            _ent = _endpoints[-1].get("whitelisted_entity") or "regulated exchange"
+            st.success(f"Funds reached {_ent}. Next step: lawful KYC request to this VASP.")
+        elif _mixers:
+            st.warning("Trail enters a mixer; further tracing has low confidence.")
+
+        # ── Altair Timeline (rendered if >= 2 hops) ──
+        if len(merged_hops_data) >= 2:
             _tl_rows = []
-            for h in hops_data:
+            for h in merged_hops_data:
                 _tl_rows.append({
                     "Hop": h["hop"],
                     "txid": h["txid"],
@@ -2723,7 +2810,7 @@ with tab4:
             _timeline_chart = (_tl_line + _tl_points).properties(
                 height=260,
                 title=alt.TitleParams(
-                    text=f"Fund Flow Timeline ({trace_direction} Trace, {len(hops_data)} Hops)",
+                    text=f"Fund Flow Timeline ({trace_direction} Trace, {len(merged_hops_data)} Hops)",
                     color=_dp["text"],
                     fontSize=12,
                 ),
@@ -2735,110 +2822,267 @@ with tab4:
                 width="stretch",
             )
 
-            # ── Hop Table ──
-            _hop_table_rows = [
-                {
-                    "Hop": h["hop"],
-                    "Role": h["role"],
-                    "TxID": f"{h['txid'][:14]}...",
-                    "Timestamp": str(h["timestamp"]),
-                    "Δt (min)": h["delta_t_minutes"],
-                    "BTC In": f"{h['btc_in']:.4f}",
-                    "Largest Output (BTC)": f"{h['largest_output_btc']:.4f}",
-                    "Retained %": f"{h['retained_pct']:.2f}%",
-                    "Peeled (BTC)": f"{h['peeled_btc']:.4f}",
-                }
-                for h in hops_data
-            ]
-            st.dataframe(pd.DataFrame(_hop_table_rows), width="stretch", hide_index=True)
+        # ── Hop Table (ALWAYS rendered) ──
+        _hop_table_rows = [
+            {
+                "Hop": h["hop"],
+                "Role": h["role"],
+                "TxID": f"{h['txid'][:14]}...",
+                "Timestamp": str(h["timestamp"]),
+                "Δt": f"{h['delta_t_minutes']:.1f} min",
+                "BTC In": f"{h['btc_in']:.4f}",
+                "Largest Output": f"{h['largest_output_btc']:.4f}",
+                "Retained %": f"{h['retained_pct']:.2f}%",
+                "Peeled": f"{h['peeled_btc']:.4f}",
+            }
+            for h in merged_hops_data
+        ]
+        st.dataframe(pd.DataFrame(_hop_table_rows), width="stretch", hide_index=True)
 
-            # ── Small PyVis Graph of Only the Path ──
-            # with the selected tx in red and the endpoint in green
-            try:
-                path_net = Network(
-                    height="280px",
-                    width="100%",
-                    bgcolor=_dp.get("chart_bg", "#0f172a"),
-                    font_color=_dp["text"],
-                    directed=True,
+        # ── PyVis Flow Graph (ALWAYS rendered, height 420px) ──
+        _ROLE_COLORS = {
+            "Source": "#3b82f6",
+            "Layering": "#f59e0b",
+            "Layering (peel)": "#f59e0b",
+            "Mixer": "#ef4444",
+            "Exchange endpoint": "#10b981",
+            "Dispersal": "#8b5cf6",
+            "Consolidation": "#ec4899",
+            "Intermediary": "#64748b",
+        }
+
+        has_only_source = (len(fwd_hops) <= 1 and len(bwd_hops) <= 1)
+        if has_only_source:
+            st.caption(f"No further spends found within {trace_hops} hops — showing direct outputs only.")
+
+        try:
+            path_net = Network(
+                height="420px",
+                width="100%",
+                bgcolor=_dp.get("graph_bgcolor", "#0D1117"),
+                font_color=_dp.get("graph_fontcolor", "#E6EDF3"),
+                directed=True,
+            )
+
+            if has_only_source:
+                # Draw selected tx at level 0 + direct outputs at level 1
+                h0 = fwd_hops[0] if fwd_hops else (bwd_hops[0] if bwd_hops else hop0_fallback)
+                role0 = h0.get("role", "Source")
+                color0 = _ROLE_COLORS.get(role0, "#3b82f6")
+                title0 = (
+                    f"TxID: {selected_txid}\n"
+                    f"Timestamp: {h0.get('timestamp')}\n"
+                    f"BTC In: {float(h0.get('btc_in', 0.0)):.4f}\n"
+                    f"Retained: {float(h0.get('retained_pct', 100.0)):.2f}%"
+                )
+                path_net.add_node(
+                    selected_txid,
+                    label=f"Hop 0 · {role0}\n{selected_txid[:8]}",
+                    title=title0,
+                    color={
+                        "background": color0,
+                        "border": "#f59e0b",
+                        "highlight": {"background": color0, "border": "#fbbf24"},
+                    },
+                    shape="box",
+                    borderWidth=3,
+                    level=0,
+                    margin={"top": 10, "bottom": 10, "left": 12, "right": 12},
+                    font={"size": 13, "color": "#ffffff", "face": "monospace", "bold": True},
                 )
 
-                for i, h in enumerate(hops_data):
-                    is_start = (i == 0)
-                    is_end = (i == len(hops_data) - 1 and len(hops_data) > 1)
+                out_addrs = flow_tracer._parse_addresses(tx_row.get("output_addresses"))[:8]
+                out_amts = flow_tracer._parse_amounts(tx_row.get("output_amounts"))[:8]
+                if not out_addrs:
+                    out_addrs = ["Unspent Output"]
+                    out_amts = [float(tx_row.get("total_amount_btc", 0.0))]
 
-                    if is_start:
-                        n_color = "#ef4444"  # Red for selected tx
-                    elif is_end:
-                        n_color = "#22c55e"  # Green for endpoint
-                    else:
-                        n_color = "#3b82f6"  # Blue for intermediate
-
-                    lbl = f"Hop {h['hop']}: {h['role']}\n{h['txid'][:8]}...\n{h['btc_in']:.2f} BTC"
-                    title_tip = (
-                        f"TxID: {h['txid']}\n"
-                        f"Role: {h['role']}\n"
-                        f"BTC In: {h['btc_in']:.4f}\n"
-                        f"Retained: {h['retained_pct']:.2f}%\n"
-                        f"Peeled: {h['peeled_btc']:.4f} BTC\n"
-                        f"Δt: {h['delta_t_minutes']:.1f} min\n"
-                        f"Time: {h['timestamp']}"
-                    )
+                for idx, addr in enumerate(out_addrs):
+                    amt = out_amts[idx] if idx < len(out_amts) else 0.0
+                    out_id = f"out_{idx}_{addr}"
+                    addr_lbl = f"{addr[:6]}...{addr[-4:]}" if len(addr) > 12 else addr
                     path_net.add_node(
-                        h["txid"],
-                        label=lbl,
-                        title=title_tip,
-                        color=n_color,
-                        shape="box",
-                        font={"size": 11, "color": "#ffffff"},
+                        out_id,
+                        label=addr_lbl,
+                        title=f"Output Address: {addr}\nAmount: {amt:.4f} BTC",
+                        color={"background": "#94a3b8", "border": "#64748b"},
+                        shape="dot",
+                        size=10,
+                        level=1,
+                        font={"size": 10, "color": _dp.get("graph_fontcolor", _dp["text"])},
                     )
-
-                for i in range(len(hops_data) - 1):
-                    src_h = hops_data[i]
-                    dst_h = hops_data[i + 1]
-                    if trace_direction == "Forward":
-                        edge_src = src_h["txid"]
-                        edge_dst = dst_h["txid"]
-                    else:
-                        edge_src = dst_h["txid"]
-                        edge_dst = src_h["txid"]
-
-                    edge_lbl = f"{dst_h['btc_in']:.2f} BTC ({dst_h['delta_t_minutes']:.0f}m)"
                     path_net.add_edge(
-                        edge_src,
-                        edge_dst,
-                        label=edge_lbl,
+                        selected_txid,
+                        out_id,
+                        label=f"{amt:.4f} BTC",
                         color={"color": "#94a3b8", "highlight": "#38bdf8"},
                         arrows="to",
-                        font={"size": 10, "color": _dp["muted"]},
+                        font={"size": 10, "color": _dp.get("graph_fontcolor", _dp["text"]), "align": "top"},
                     )
+            else:
+                added_node_ids = set()
 
-                path_net.set_options("""
-                {
-                  "physics": {
-                    "enabled": true,
-                    "stabilization": { "enabled": true, "iterations": 200, "fit": true },
-                    "hierarchicalRepulsion": { "nodeDistance": 130 },
-                    "solver": "hierarchicalRepulsion"
-                  },
-                  "layout": {
-                    "hierarchical": { "enabled": true, "direction": "LR", "sortMethod": "directed" }
-                  }
+                # Add backward nodes (level = -hop)
+                for h in bwd_hops:
+                    tid = h["txid"]
+                    if tid not in added_node_ids:
+                        is_sel = (tid == selected_txid)
+                        lvl = 0 if is_sel else -int(h["hop"])
+                        role = h.get("role", "Intermediary")
+                        role_col = _ROLE_COLORS.get(role, "#64748b")
+                        title_tip = (
+                            f"TxID: {h['txid']}\n"
+                            f"Timestamp: {h['timestamp']}\n"
+                            f"BTC In: {float(h['btc_in']):.4f}\n"
+                            f"Retained: {float(h['retained_pct']):.2f}%"
+                        )
+                        if is_sel:
+                            n_col = {
+                                "background": role_col,
+                                "border": "#f59e0b",
+                                "highlight": {"background": role_col, "border": "#fbbf24"},
+                            }
+                            bw = 3
+                            f_size = 13
+                            f_bold = True
+                            margin = {"top": 10, "bottom": 10, "left": 12, "right": 12}
+                        else:
+                            n_col = {
+                                "background": role_col,
+                                "border": role_col,
+                                "highlight": {"background": role_col, "border": "#38bdf8"},
+                            }
+                            bw = 1
+                            f_size = 10
+                            f_bold = False
+                            margin = {"top": 6, "bottom": 6, "left": 8, "right": 8}
+
+                        path_net.add_node(
+                            tid,
+                            label=f"Hop {lvl} · {role}\n{tid[:8]}",
+                            title=title_tip,
+                            color=n_col,
+                            shape="box",
+                            borderWidth=bw,
+                            level=lvl,
+                            margin=margin,
+                            font={"size": f_size, "color": "#ffffff", "face": "monospace", "bold": f_bold},
+                        )
+                        added_node_ids.add(tid)
+
+                # Add forward nodes (level = +hop)
+                for h in fwd_hops:
+                    tid = h["txid"]
+                    if tid not in added_node_ids:
+                        is_sel = (tid == selected_txid)
+                        lvl = int(h["hop"])
+                        role = h.get("role", "Intermediary")
+                        role_col = _ROLE_COLORS.get(role, "#64748b")
+                        title_tip = (
+                            f"TxID: {h['txid']}\n"
+                            f"Timestamp: {h['timestamp']}\n"
+                            f"BTC In: {float(h['btc_in']):.4f}\n"
+                            f"Retained: {float(h['retained_pct']):.2f}%"
+                        )
+                        if is_sel:
+                            n_col = {
+                                "background": role_col,
+                                "border": "#f59e0b",
+                                "highlight": {"background": role_col, "border": "#fbbf24"},
+                            }
+                            bw = 3
+                            f_size = 13
+                            f_bold = True
+                            margin = {"top": 10, "bottom": 10, "left": 12, "right": 12}
+                        else:
+                            n_col = {
+                                "background": role_col,
+                                "border": role_col,
+                                "highlight": {"background": role_col, "border": "#38bdf8"},
+                            }
+                            bw = 1
+                            f_size = 10
+                            f_bold = False
+                            margin = {"top": 6, "bottom": 6, "left": 8, "right": 8}
+
+                        path_net.add_node(
+                            tid,
+                            label=f"Hop {lvl} · {role}\n{tid[:8]}",
+                            title=title_tip,
+                            color=n_col,
+                            shape="box",
+                            borderWidth=bw,
+                            level=lvl,
+                            margin=margin,
+                            font={"size": f_size, "color": "#ffffff", "face": "monospace", "bold": f_bold},
+                        )
+                        added_node_ids.add(tid)
+
+                # Add edges
+                added_edges = set()
+
+                # Backward edges: flow upstream -> downstream (bwd_hops[i+1] -> bwd_hops[i])
+                for i in range(len(bwd_hops) - 1):
+                    src_tid = bwd_hops[i + 1]["txid"]
+                    dst_tid = bwd_hops[i]["txid"]
+                    if (src_tid, dst_tid) not in added_edges and src_tid in added_node_ids and dst_tid in added_node_ids:
+                        amt = float(bwd_hops[i].get("btc_in", 0.0))
+                        path_net.add_edge(
+                            src_tid,
+                            dst_tid,
+                            label=f"{amt:.4f} BTC",
+                            color={"color": "#94a3b8", "highlight": "#38bdf8"},
+                            arrows="to",
+                            font={"size": 10, "color": _dp.get("graph_fontcolor", _dp["text"]), "align": "top"},
+                        )
+                        added_edges.add((src_tid, dst_tid))
+
+                # Forward edges: flow parent -> child (fwd_hops[i] -> fwd_hops[i+1])
+                for i in range(len(fwd_hops) - 1):
+                    src_tid = fwd_hops[i]["txid"]
+                    dst_tid = fwd_hops[i + 1]["txid"]
+                    if (src_tid, dst_tid) not in added_edges and src_tid in added_node_ids and dst_tid in added_node_ids:
+                        amt = float(fwd_hops[i + 1].get("btc_in", 0.0))
+                        path_net.add_edge(
+                            src_tid,
+                            dst_tid,
+                            label=f"{amt:.4f} BTC",
+                            color={"color": "#94a3b8", "highlight": "#38bdf8"},
+                            arrows="to",
+                            font={"size": 10, "color": _dp.get("graph_fontcolor", _dp["text"]), "align": "top"},
+                        )
+                        added_edges.add((src_tid, dst_tid))
+
+            path_net.set_options("""
+            {
+              "physics": {
+                "enabled": true,
+                "stabilization": { "iterations": 200, "fit": true },
+                "hierarchicalRepulsion": { "nodeDistance": 160 }
+              },
+              "layout": {
+                "hierarchical": {
+                  "enabled": true,
+                  "direction": "LR",
+                  "sortMethod": "directed",
+                  "levelSeparation": 180
                 }
-                """)
-                _path_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w")
-                path_net.save_graph(_path_tmp.name)
-                with open(_path_tmp.name, "r") as _pf:
-                    _path_html = _pf.read()
-                _path_html = _path_html.replace(
-                    "return network;",
-                    'network.once("stabilizationIterationsDone", function() { network.fit(); });\n'
-                    'network.once("stabilized", function() { network.fit(); });\n'
-                    'return network;'
-                )
-                components.html(_path_html, height=290, scrolling=False)
-            except Exception as _p_err:
-                st.caption(f"Path visualizer note: {_p_err}")
+              }
+            }
+            """)
+            _path_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w")
+            path_net.save_graph(_path_tmp.name)
+            with open(_path_tmp.name, "r") as _pf:
+                _path_html = _pf.read()
+            _path_html = _path_html.replace(
+                "return network;",
+                'network.once("stabilizationIterationsDone", function() { network.fit(); });\n'
+                'network.once("stabilized", function() { network.fit(); });\n'
+                'return network;'
+            )
+            components.html(_path_html, height=430, scrolling=False)
+        except Exception as _p_err:
+            st.caption(f"Path visualizer note: {_p_err}")
 
         # ── Address Flow Detail ──
         st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
