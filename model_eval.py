@@ -241,12 +241,12 @@ def run_evaluation_and_training(
         assert col not in X.columns, f"[LEAKAGE ERROR] Label column '{col}' found in feature matrix X!"
 
     # 3. Model specification:
-    # CalibratedClassifierCV(RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=-1), method="isotonic", cv=3)
+    # CalibratedClassifierCV(RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=1), method="isotonic", cv=3)
     base_rf = RandomForestClassifier(
         n_estimators=300,
         class_weight="balanced",
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,
     )
     calibrated_model = CalibratedClassifierCV(
         estimator=base_rf,
@@ -262,7 +262,7 @@ def run_evaluation_and_training(
         y,
         cv=cv,
         method="predict_proba",
-        n_jobs=-1,
+        n_jobs=1,
     )
     df["ml_probability"] = (cv_proba[:, 1] * 100.0).round(2)
 
@@ -283,7 +283,7 @@ def run_evaluation_and_training(
         n_estimators=300,
         class_weight="balanced",
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,
     )
     rf_uncal.fit(X_train, y_train)
     uncal_test_proba = rf_uncal.predict_proba(X_test)[:, 1]

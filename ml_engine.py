@@ -1537,28 +1537,25 @@ def compute_taint(df: pd.DataFrame, watchlist: Dict[str, list] | None = None,
             for idx in tx_scores:
                 df.at[idx, "taint_score"] = 50.0  # all equal, non-zero
 
-    # Compute taint_hops: BFS from watchlist nodes outwards (cutoff=4)
-    # Scales O(|watchlist_nodes| * (|V| + |E|)) instead of O(|df| * |watchlist_nodes| * (|V| + |E|))
+    # Compute taint_hops: ONE multi-source Dijkstra from watchlist seeds outwards (cutoff=4)
     tx_min_hops: dict[str, int] = {}
     tx_nearest_label: dict[str, str] = {}
-    for wl_node in watchlist_nodes:
-        lbl = node_to_label.get(wl_node, "Threat Indicator")
-        try:
-            lengths = nx.single_source_shortest_path_length(G, wl_node, cutoff=4)
-            for node, dist in lengths.items():
-                if node.startswith("tx:"):
-                    txid = node[3:]
-                    if txid not in tx_min_hops or dist < tx_min_hops[txid]:
-                        tx_min_hops[txid] = min(dist, 4)
-                        tx_nearest_label[txid] = lbl
-        except Exception:
-            continue
+    try:
+        lengths, paths = nx.multi_source_dijkstra(G, watchlist_nodes, cutoff=4)
+        for node, dist in lengths.items():
+            if node.startswith("tx:"):
+                txid = node[3:]
+                tx_min_hops[txid] = min(dist, 4)
+                source_seed = paths[node][0]
+                tx_nearest_label[txid] = node_to_label.get(source_seed, "Threat Indicator")
+    except Exception:
+        pass
 
     for idx in df.index:
         txid = str(df.at[idx, "txid"])
         if txid in tx_min_hops:
             df.at[idx, "taint_hops"] = tx_min_hops[txid]
-            df.at[idx, "taint_nearest_label"] = tx_nearest_label[txid]
+            df.at[idx, "taint_nearest_label"] = tx_nearest_label.get(txid, "Threat Indicator")
 
     # ── Forensic context prepending for explanations ──
     if "explanation" in df.columns:
@@ -1590,6 +1587,25 @@ def compute_taint(df: pd.DataFrame, watchlist: Dict[str, list] | None = None,
 # ═══════════════════════════════════════════════════════════════════════════
 # 7. FULL PIPELINE ENTRIES
 # ═══════════════════════════════════════════════════════════════════════════
+
+_CACHED_RF_MODEL = None
+_CACHED_RF_LOADED = False
+
+def _get_cached_rf_model(model_path: str = "models/rf_model.joblib"):
+    """Load pre-trained calibrated RF model once and cache at module level."""
+    global _CACHED_RF_MODEL, _CACHED_RF_LOADED
+    if not _CACHED_RF_LOADED:
+        _CACHED_RF_LOADED = True
+        if os.path.isfile(model_path):
+            try:
+                import joblib
+                _CACHED_RF_MODEL = joblib.load(model_path)
+            except Exception:
+                _CACHED_RF_MODEL = None
+        else:
+            _CACHED_RF_MODEL = None
+    return _CACHED_RF_MODEL
+
 
 def run_pipeline(
     input_csv: str = INPUT_CSV,
@@ -1634,15 +1650,26 @@ def run_pipeline(
     if "attack_type" in enriched_df.columns and "ml_probability" not in enriched_df.columns:
         try:
             X_inf = select_informative_features(features)
-            y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
-            from sklearn.ensemble import RandomForestClassifier
-            from sklearn.calibration import CalibratedClassifierCV
-            from sklearn.model_selection import StratifiedKFold, cross_val_predict
-            _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=-1)
-            _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
-            _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-            _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=-1)[:, 1]
-            enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+            _rf_model = _get_cached_rf_model()
+            _features_match = False
+            if _rf_model is not None and hasattr(_rf_model, "feature_names_in_"):
+                _features_match = list(X_inf.columns) == list(_rf_model.feature_names_in_)
+            elif _rf_model is not None and hasattr(_rf_model, "n_features_in_"):
+                _features_match = X_inf.shape[1] == _rf_model.n_features_in_
+
+            if _rf_model is not None and _features_match:
+                _probas = _rf_model.predict_proba(X_inf)[:, 1]
+                enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+            else:
+                y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
+                from sklearn.ensemble import RandomForestClassifier
+                from sklearn.calibration import CalibratedClassifierCV
+                from sklearn.model_selection import StratifiedKFold, cross_val_predict
+                _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=1)
+                _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
+                _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+                _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=1)[:, 1]
+                enriched_df["ml_probability"] = (_probas * 100.0).round(2)
         except Exception:
             pass
     compute_fused_priority(enriched_df, features)
@@ -1714,15 +1741,26 @@ def run_pipeline_from_df(
     if "attack_type" in enriched_df.columns and "ml_probability" not in enriched_df.columns:
         try:
             X_inf = select_informative_features(features)
-            y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
-            from sklearn.ensemble import RandomForestClassifier
-            from sklearn.calibration import CalibratedClassifierCV
-            from sklearn.model_selection import StratifiedKFold, cross_val_predict
-            _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=-1)
-            _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
-            _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-            _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=-1)[:, 1]
-            enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+            _rf_model = _get_cached_rf_model()
+            _features_match = False
+            if _rf_model is not None and hasattr(_rf_model, "feature_names_in_"):
+                _features_match = list(X_inf.columns) == list(_rf_model.feature_names_in_)
+            elif _rf_model is not None and hasattr(_rf_model, "n_features_in_"):
+                _features_match = X_inf.shape[1] == _rf_model.n_features_in_
+
+            if _rf_model is not None and _features_match:
+                _probas = _rf_model.predict_proba(X_inf)[:, 1]
+                enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+            else:
+                y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
+                from sklearn.ensemble import RandomForestClassifier
+                from sklearn.calibration import CalibratedClassifierCV
+                from sklearn.model_selection import StratifiedKFold, cross_val_predict
+                _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=1)
+                _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
+                _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+                _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=1)[:, 1]
+                enriched_df["ml_probability"] = (_probas * 100.0).round(2)
         except Exception:
             pass
     compute_fused_priority(enriched_df, features)

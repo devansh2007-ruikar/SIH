@@ -764,15 +764,26 @@ class BaseTransactionAdapter(ABC):
         if "attack_type" in enriched_df.columns and "ml_probability" not in enriched_df.columns:
             try:
                 X_inf = ml_engine.select_informative_features(features)
-                y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
-                from sklearn.ensemble import RandomForestClassifier
-                from sklearn.calibration import CalibratedClassifierCV
-                from sklearn.model_selection import StratifiedKFold, cross_val_predict
-                _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=-1)
-                _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
-                _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-                _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=-1)[:, 1]
-                enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+                _rf_model = ml_engine._get_cached_rf_model()
+                _features_match = False
+                if _rf_model is not None and hasattr(_rf_model, "feature_names_in_"):
+                    _features_match = list(X_inf.columns) == list(_rf_model.feature_names_in_)
+                elif _rf_model is not None and hasattr(_rf_model, "n_features_in_"):
+                    _features_match = X_inf.shape[1] == _rf_model.n_features_in_
+
+                if _rf_model is not None and _features_match:
+                    _probas = _rf_model.predict_proba(X_inf)[:, 1]
+                    enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+                else:
+                    y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
+                    from sklearn.ensemble import RandomForestClassifier
+                    from sklearn.calibration import CalibratedClassifierCV
+                    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+                    _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=1)
+                    _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
+                    _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+                    _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=1)[:, 1]
+                    enriched_df["ml_probability"] = (_probas * 100.0).round(2)
             except Exception as _e:
                 ml_engine._log(f"[!] Supervised cross-val scoring note: {_e}")
 
