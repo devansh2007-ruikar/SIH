@@ -112,7 +112,7 @@ def _classify_hop_role(
     if hop == 0:
         return "Source"
 
-    det_type = str(row.get("detected_type") or row.get("attack_type") or "")
+    det_type = str(row.get("detected_type") or "")
     if det_type == "CoinJoin_Mixer":
         return "Mixer"
 

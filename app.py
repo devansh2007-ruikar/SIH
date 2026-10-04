@@ -17,6 +17,7 @@ Dependencies:
 import subprocess
 import sys
 import tempfile
+import time
 import os
 import json
 import socket
@@ -823,10 +824,10 @@ if uploaded_watchlist is not None:
     custom_wl_bad.to_csv(os.path.join("sample_data", "watchlist.csv"), index=False)
 
 
-def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
+def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float, start_time: Optional[float] = None):
     """Run the full AI pipeline via the polymorphic adapter, then enrich with offline Geo-ASN."""
-    import time
-    _t_start = time.perf_counter()
+    if start_time is None:
+        start_time = time.perf_counter()
 
     if "geo_country" not in raw_df.columns:
         raw_df["geo_country"] = "XX"
@@ -850,7 +851,7 @@ def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
         except Exception as _cl_err:
             pass
 
-    _elapsed = time.perf_counter() - _t_start
+    _elapsed = time.perf_counter() - start_time
     st.session_state["pipeline_elapsed_s"] = _elapsed
     st.session_state["pipeline_tx_count"] = len(enriched_df)
 
@@ -903,11 +904,12 @@ if upload_mode == "Separate network + blockchain files" and (uploaded_net_file o
     # ── Separate-file mode ──
     if uploaded_net_file and uploaded_chain_file:
         try:
+            _parse_start = time.perf_counter()
             raw_df, adapter, file_hash, correlation_stats = _load_separate_files(
                 uploaded_net_file, uploaded_chain_file, is_upload=True,
             )
             with st.spinner("🧠 AI Engine running — detecting anomalies (correlated mode)..."):
-                df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
+                df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
                 data_source = "uploaded_separate"
 
             with st.sidebar:
@@ -929,6 +931,7 @@ if upload_mode == "Separate network + blockchain files" and (uploaded_net_file o
 
 elif uploaded_file is not None:
     try:
+        _parse_start = time.perf_counter()
         # Calculate SHA-256 of uploaded file for data provenance
         file_bytes = uploaded_file.getvalue()
         file_hash = hashlib.sha256(file_bytes).hexdigest()
@@ -946,7 +949,7 @@ elif uploaded_file is not None:
             os.remove(tmp_path)
 
         with st.spinner("🧠 AI Engine running — detecting anomalies..."):
-            df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
+            df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
             data_source = "uploaded"
 
         with st.sidebar:
@@ -976,11 +979,12 @@ else:
 
     if upload_mode == "Separate network + blockchain files" and os.path.isfile(_NET_DEFAULT) and os.path.isfile(_CHAIN_DEFAULT):
         try:
+            _parse_start = time.perf_counter()
             raw_df, adapter, file_hash, correlation_stats = _load_separate_files(
                 _NET_DEFAULT, _CHAIN_DEFAULT, is_upload=False,
             )
             with st.spinner("🧠 AI Engine running on default split dataset (correlated)..."):
-                df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
+                df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
                 data_source = "default_separate"
 
             with st.sidebar:
@@ -1000,6 +1004,7 @@ else:
         _default_path = DEFAULT_DATASET if os.path.isfile(DEFAULT_DATASET) else _FALLBACK_DATASET
         if os.path.isfile(_default_path):
             try:
+                _parse_start = time.perf_counter()
                 # Calculate SHA-256 of default dataset
                 with open(_default_path, "rb") as f:
                     file_bytes = f.read()
@@ -1008,7 +1013,7 @@ else:
                 adapter = get_adapter(_default_path)
                 raw_df = adapter.load(_default_path)
                 with st.spinner("🧠 AI Engine running on default dataset..."):
-                    df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
+                    df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
                     data_source = "default"
 
                 with st.sidebar:
@@ -1371,7 +1376,7 @@ with tab1:
         unsafe_allow_html=True,
     )
 
-    _geo_world_path = os.path.join("data", "geo", "world-110m.json")
+    _geo_world_path = os.path.join("static", "world-110m.json")
     _iso_codes_path = os.path.join("data", "geo", "iso_codes.csv")
 
     _iso_lookup_df = None
@@ -1421,11 +1426,21 @@ with tab1:
         if not _asn_flagged.empty:
             _asn_top = _asn_flagged.groupby(["asn", "asn_org"], as_index=False).size()
             _asn_top.columns = ["ASN", "Organisation", "Flagged Count"]
-            _asn_top10 = _asn_top.sort_values("Flagged Count", ascending=False).head(10)
+            _asn_top["ASN"] = _asn_top["ASN"].replace({"AS0": "Unresolved", 0: "Unresolved", "0": "Unresolved"})
+            _is_unres = _asn_top["ASN"].eq("Unresolved")
+            _asn_top10 = _asn_top.assign(_sort_unres=_is_unres).sort_values(
+                by=["_sort_unres", "Flagged Count"], ascending=[True, False]
+            ).drop(columns=["_sort_unres"]).head(10)
         else:
             _asn_top10 = pd.DataFrame(columns=["ASN", "Organisation", "Flagged Count"])
     else:
         _asn_top10 = pd.DataFrame(columns=["ASN", "Organisation", "Flagged Count"])
+
+    _asn_col_config = {
+        "ASN": st.column_config.TextColumn("ASN", width="small"),
+        "Organisation": st.column_config.TextColumn("Organisation", width="medium"),
+        "Flagged Count": st.column_config.NumberColumn("Flagged Count", width="small"),
+    }
 
     # Render: Map (if available) + Bar Chart & ASN Table
     _map_available = os.path.isfile(_geo_world_path) and (_iso_lookup_df is not None)
@@ -1438,23 +1453,20 @@ with tab1:
                 unsafe_allow_html=True,
             )
             try:
-                with open(_geo_world_path, "r", encoding="utf-8") as _wf:
-                    _world_topo = json.load(_wf)
-
-                _source = alt.InlineData(
-                    values=_world_topo,
+                _source = alt.Data(
+                    url="app/static/world-110m.json",
                     format=alt.DataFormat(type="topojson", feature="countries"),
                 )
-
-                _map_chart = alt.Chart(_source).mark_geoshape(
-                    stroke=_cp.get("chart_grid", "#334155"),
-                    strokeWidth=0.4,
-                ).transform_lookup(
+                _base = alt.Chart(_source).mark_geoshape(
+                    fill="#e5e7eb",
+                    stroke="#94a3b8",
+                )
+                _colored = alt.Chart(_source).mark_geoshape().transform_lookup(
                     lookup="id",
                     from_=alt.LookupData(
                         data=_country_stats,
                         key="id",
-                        fields=["country_name", "flagged", "total", "avg_risk"],
+                        fields=["flagged", "total", "avg_risk", "country_name"],
                     ),
                 ).encode(
                     color=alt.Color(
@@ -1473,14 +1485,13 @@ with tab1:
                         alt.Tooltip("flagged:Q", title="Flagged Tx"),
                         alt.Tooltip("avg_risk:Q", title="Average Risk", format=".1f"),
                     ],
-                ).project(
-                    type="equalEarth",
-                ).properties(
-                    height=360,
-                ).configure(
-                    background=_cp["chart_bg"],
-                ).configure_view(
-                    strokeWidth=0,
+                )
+                _map_chart = (
+                    (_base + _colored)
+                    .project("equalEarth")
+                    .properties(height=360)
+                    .configure(background=_cp["chart_bg"])
+                    .configure_view(strokeWidth=0)
                 )
 
                 st.altair_chart(_map_chart, width="stretch")
@@ -1523,7 +1534,7 @@ with tab1:
                 unsafe_allow_html=True,
             )
             if not _asn_top10.empty:
-                st.dataframe(_asn_top10, hide_index=True, width="stretch")
+                st.dataframe(_asn_top10, hide_index=True, width="stretch", column_config=_asn_col_config)
             else:
                 st.info("No ASN telemetry recorded.")
 
@@ -1560,7 +1571,7 @@ with tab1:
                 unsafe_allow_html=True,
             )
             if not _asn_top10.empty:
-                st.dataframe(_asn_top10, hide_index=True, width="stretch")
+                st.dataframe(_asn_top10, hide_index=True, width="stretch", column_config=_asn_col_config)
             else:
                 st.info("No ASN telemetry recorded.")
 
@@ -1943,7 +1954,7 @@ with tab2:
             <span style="color: #fbbf24; font-size: 0.78rem; font-weight: 600;">
                 &#9888;&#65039; Network observation correlation &mdash; not absolute identity attribution
                 (Subject to VPN / NAT / Tor limits).
-                ASN and geo-country are resolved offline via a local MaxMind GeoLite2 database; unmatched IPs are shown as Unknown.
+                ASN and geo-country are resolved offline via a local DB-IP Lite (offline) database; unmatched IPs are shown as Unknown.
             </span>
         </div>
         """,
@@ -2575,37 +2586,40 @@ with tab4:
                 pass  # Fall through to telemetry table
 
         # ── Telemetry Table ──
+        obs_count = int(tx_row.get("ip_observation_count", 0)) if pd.notna(tx_row.get("ip_observation_count")) else 0
         telemetry_str = tx_row.get("telemetry", "")
+        telemetry_data = []
         if isinstance(telemetry_str, str) and telemetry_str.strip():
             try:
                 telemetry_data = json.loads(telemetry_str)
-                if telemetry_data:
-                    _rows_html = []
-                    for item in telemetry_data:
-                        fname = item.get("label", item.get("feature_name", ""))
-                        obs = item.get("observed_value", 0.0)
-                        p_rank = item.get("percentile_rank", 0.0)
-                        med = item.get("dataset_median", 0.0)
-                        reason = item.get("audit_reason", "")
-                        _rows_html.append(
-                            f'<tr><td><b>{fname}</b></td>'
-                            f'<td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">{obs:.4f}</td>'
-                            f'<td>{p_rank:.1f}th Percentile (Med: {med:.4f})</td>'
-                            f'<td style="color: #f87171;">{reason}</td></tr>'
-                        )
-                    _table_html = (
-                        '<table class="heuristic-table">'
-                        '<thead><tr><th>Feature</th><th>Value</th><th>Statistical Deviation</th><th>Audit Reason</th></tr></thead>'
-                        '<tbody>' + ''.join(_rows_html) + '</tbody>'
-                        '</table>'
-                    )
-                    st.markdown(_table_html, unsafe_allow_html=True)
-                else:
-                    st.info("No extreme statistical deviations detected for this transaction.")
-            except Exception as e:
-                st.error("Error parsing telemetry data.")
-        else:
+            except Exception:
+                telemetry_data = []
+
+        if obs_count == 0:
             st.info("No structured telemetry data available for this transaction.")
+        elif telemetry_data:
+            _rows_html = []
+            for item in telemetry_data:
+                fname = item.get("label", item.get("feature_name", ""))
+                obs = item.get("observed_value", 0.0)
+                p_rank = item.get("percentile_rank", 0.0)
+                med = item.get("dataset_median", 0.0)
+                reason = item.get("audit_reason", "")
+                _rows_html.append(
+                    f'<tr><td><b>{fname}</b></td>'
+                    f'<td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">{obs:.4f}</td>'
+                    f'<td>{p_rank:.1f}th Percentile (Med: {med:.4f})</td>'
+                    f'<td style="color: #f87171;">{reason}</td></tr>'
+                )
+            _table_html = (
+                '<table class="heuristic-table">'
+                '<thead><tr><th>Feature</th><th>Value</th><th>Statistical Deviation</th><th>Audit Reason</th></tr></thead>'
+                '<tbody>' + ''.join(_rows_html) + '</tbody>'
+                '</table>'
+            )
+            st.markdown(_table_html, unsafe_allow_html=True)
+        else:
+            st.info("No extreme statistical deviations detected for this transaction.")
 
         # ── 🧭 Follow the Money ──
         st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
@@ -2638,8 +2652,8 @@ with tab4:
         else:
             hops_data = flow_tracer.trace_backward(df, selected_txid, max_hops=trace_hops)
 
-        if not hops_data:
-            st.info("No transaction hops found for this identifier.")
+        if not hops_data or len(hops_data) <= 1:
+            st.info(f"No downstream spends found within {trace_hops} hops. Try a Peel_Chain transaction.")
         else:
             # ── Next Step Box ──
             last_hop = hops_data[-1]
@@ -2802,6 +2816,8 @@ with tab4:
                 path_net.set_options("""
                 {
                   "physics": {
+                    "enabled": true,
+                    "stabilization": { "enabled": true, "iterations": 200, "fit": true },
                     "hierarchicalRepulsion": { "nodeDistance": 130 },
                     "solver": "hierarchicalRepulsion"
                   },
@@ -2814,6 +2830,12 @@ with tab4:
                 path_net.save_graph(_path_tmp.name)
                 with open(_path_tmp.name, "r") as _pf:
                     _path_html = _pf.read()
+                _path_html = _path_html.replace(
+                    "return network;",
+                    'network.once("stabilizationIterationsDone", function() { network.fit(); });\n'
+                    'network.once("stabilized", function() { network.fit(); });\n'
+                    'return network;'
+                )
                 components.html(_path_html, height=290, scrolling=False)
             except Exception as _p_err:
                 st.caption(f"Path visualizer note: {_p_err}")
@@ -2961,6 +2983,12 @@ with tab5:
                 </div>
                 """,
                 unsafe_allow_html=True,
+            )
+
+            st.info(
+                "Scores are on MITHYA's own synthetic data, where attack patterns are clearly separable; "
+                "this proves the pipeline works end-to-end, not real-world accuracy. "
+                "Isolation Forest (unsupervised, no labels) reaches ROC-AUC 0.95."
             )
 
             # ── 2. Hold-out Benchmark Table (4 Methods) ──
@@ -3119,7 +3147,14 @@ with tab6:
     _n_entities = len(_profile_df)
     _n_clusters = _profile_df["behaviour_cluster"].nunique() if "behaviour_cluster" in _profile_df.columns else 0
     _n_outliers = int((_profile_df["behaviour_cluster"] == "Behavioural outlier").sum()) if "behaviour_cluster" in _profile_df.columns else 0
-    _n_comms = _profile_df["graph_community"].nunique() if "graph_community" in _profile_df.columns else 0
+    if "graph_community" in _profile_df.columns:
+        _comm_counts = _profile_df["graph_community"].value_counts()
+        _qualifying_comms = _comm_counts[_comm_counts >= 3]
+        _n_comms = len(_qualifying_comms)
+        _isolated_entities = int(_comm_counts[_comm_counts < 3].sum())
+    else:
+        _n_comms = 0
+        _isolated_entities = 0
 
     st.markdown(
         f"""
@@ -3144,9 +3179,9 @@ with tab6:
             </div>
             <div class="bento-card card-green">
                 <div class="card-icon">🕸️</div>
-                <div class="card-label">Graph Communities</div>
+                <div class="card-label">Graph Communities (≥3 entities)</div>
                 <div class="card-value">{_n_comms}</div>
-                <div class="card-sub">Louvain modularity partitions</div>
+                <div class="card-sub">{_isolated_entities:,} isolated entities not shown</div>
             </div>
         </div>
         """,
@@ -3197,6 +3232,8 @@ with tab6:
 
     _cluster_summary = clustering.build_cluster_summary_table(df, _profile_df)
     _comm_summary = clustering.build_community_summary_table(df, _profile_df)
+    if "Entities" in _comm_summary.columns:
+        _comm_summary = _comm_summary[_comm_summary["Entities"] >= 3].reset_index(drop=True)
 
     with _tbl_col1:
         st.markdown(f'<h5 style="color:{_p6["text"]};margin-bottom:0.4rem;">Behavioural Clusters Summary</h5>', unsafe_allow_html=True)
@@ -3212,6 +3249,7 @@ with tab6:
     with _tbl_col2:
         st.markdown(f'<h5 style="color:{_p6["text"]};margin-bottom:0.4rem;">Graph Communities Summary (Louvain)</h5>', unsafe_allow_html=True)
         st.dataframe(_comm_summary, width="stretch", hide_index=True)
+        st.caption(f"{_isolated_entities:,} isolated entities not shown")
         st.download_button(
             "📥 Download Community Table (CSV)",
             data=_comm_summary.to_csv(index=False),
