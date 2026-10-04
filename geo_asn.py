@@ -86,6 +86,7 @@ _SEARCH_PATHS: List[str] = []
 # Build search paths relative to this file's location
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SEARCH_PATHS.extend([
+    os.path.join(_THIS_DIR, "data", "geo"),
     os.path.join(_THIS_DIR, "data"),
     _THIS_DIR,
     "/usr/share/GeoIP",
@@ -94,12 +95,15 @@ _SEARCH_PATHS.extend([
 ])
 
 
-def _find_mmdb(filename: str) -> Optional[str]:
-    """Search for a .mmdb file across known paths. Returns absolute path or None."""
-    for search_dir in _SEARCH_PATHS:
-        candidate = os.path.join(search_dir, filename)
-        if os.path.isfile(candidate):
-            return candidate
+def _find_mmdb(filenames: Union[str, List[str]]) -> Optional[str]:
+    """Search for a .mmdb file across known paths in priority order. Returns absolute path or None."""
+    if isinstance(filenames, str):
+        filenames = [filenames]
+    for fn in filenames:
+        for search_dir in _SEARCH_PATHS:
+            candidate = os.path.join(search_dir, fn)
+            if os.path.isfile(candidate):
+                return candidate
     return None
 
 
@@ -110,17 +114,16 @@ _asn_reader = None
 try:
     import maxminddb
 
-    _country_path = _find_mmdb("GeoLite2-Country.mmdb")
-    _asn_path = _find_mmdb("GeoLite2-ASN.mmdb")
+    _country_path = _find_mmdb(["GeoLite2-Country.mmdb", "dbip-country-lite.mmdb"])
+    _asn_path = _find_mmdb(["GeoLite2-ASN.mmdb", "dbip-asn-lite.mmdb"])
 
     if _country_path:
         _country_reader = maxminddb.open_database(_country_path)
         logger.info("[geo_asn] Loaded Country DB: %s", _country_path)
     else:
         logger.warning(
-            "[geo_asn] GeoLite2-Country.mmdb not found in search paths. "
-            "Country lookups will return 'XX'. "
-            "Download from: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data"
+            "[geo_asn] Neither GeoLite2-Country.mmdb nor dbip-country-lite.mmdb found in search paths. "
+            "Country lookups will return 'XX'."
         )
 
     if _asn_path:
@@ -128,9 +131,8 @@ try:
         logger.info("[geo_asn] Loaded ASN DB: %s", _asn_path)
     else:
         logger.warning(
-            "[geo_asn] GeoLite2-ASN.mmdb not found in search paths. "
-            "ASN lookups will return 'AS0'. "
-            "Download from: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data"
+            "[geo_asn] Neither GeoLite2-ASN.mmdb nor dbip-asn-lite.mmdb found in search paths. "
+            "ASN lookups will return 'AS0'."
         )
 
 except ImportError:
@@ -289,7 +291,7 @@ def enrich_dataframe(
     Add ``geo_country``, ``asn``, and ``asn_org`` columns using offline resolution.
 
     If ``geo_country`` already exists, it is overwritten with the
-    offline-resolved value only when the existing value is null/unknown.
+    offline-resolved value only when the existing value is null/unknown/XX.
 
     Parameters
     ----------
@@ -313,17 +315,22 @@ def enrich_dataframe(
         df["asn_org"] = "Unknown"
         return df
 
-    results = resolve_ips_batch(df[ip_col])
+    # Speed optimization: resolve each unique IP address only once
+    unique_ips = df[ip_col].dropna().drop_duplicates()
+    resolved_dict = {ip: resolve_ip(ip) for ip in unique_ips}
 
-    geo_col = results.apply(lambda r: r["geo_country"])
-    asn_col = results.apply(lambda r: r["asn"])
-    org_col = results.apply(lambda r: r["asn_org"])
+    geo_map = {ip: res["geo_country"] for ip, res in resolved_dict.items()}
+    asn_map = {ip: res["asn"] for ip, res in resolved_dict.items()}
+    org_map = {ip: res["asn_org"] for ip, res in resolved_dict.items()}
 
-    # Overwrite only when existing value is null / unknown / missing
+    geo_col = df[ip_col].map(geo_map).fillna("XX")
+    asn_col = df[ip_col].map(asn_map).fillna("AS0")
+    org_col = df[ip_col].map(org_map).fillna("Unknown")
+
+    # Overwrite only when existing value is null / unknown / missing / XX
     if "geo_country" in df.columns:
         mask = df["geo_country"].isnull() | df["geo_country"].isin(["", "nan", "XX"])
         df.loc[mask, "geo_country"] = geo_col[mask]
-        df.loc[df["geo_country"].isnull(), "geo_country"] = geo_col[df["geo_country"].isnull()]
     else:
         df["geo_country"] = geo_col
 
@@ -334,11 +341,28 @@ def enrich_dataframe(
 
 
 def db_status() -> Dict[str, Optional[str]]:
-    """Return the paths of loaded databases (or None if not loaded)."""
+    """Return the paths and status of loaded databases, reporting which DB is in use."""
+    country_in_use = os.path.basename(_country_path) if (_country_reader and _country_path) else None
+    asn_in_use = os.path.basename(_asn_path) if (_asn_reader and _asn_path) else None
+
+    # Determine user-friendly database name / type
+    if country_in_use and "dbip" in country_in_use.lower():
+        db_label = "DB-IP Lite (2026-10)"
+    elif country_in_use and "geolite2" in country_in_use.lower():
+        db_label = "MaxMind GeoLite2"
+    elif country_in_use:
+        db_label = country_in_use
+    else:
+        db_label = None
+
     return {
-        "country_db": getattr(_country_reader, "_buffer", None) and str(_country_path) if _country_reader else None,
-        "asn_db": getattr(_asn_reader, "_buffer", None) and str(_asn_path) if _asn_reader else None,
-        "maxminddb_installed": _country_reader is not None or _asn_reader is not None or False,
+        "country_db": str(_country_path) if (_country_reader and _country_path) else None,
+        "country_db_name": country_in_use,
+        "asn_db": str(_asn_path) if (_asn_reader and _asn_path) else None,
+        "asn_db_name": asn_in_use,
+        "database_in_use": db_label or "none",
+        "db_name": db_label,
+        "maxminddb_installed": _country_reader is not None or _asn_reader is not None,
     }
 
 

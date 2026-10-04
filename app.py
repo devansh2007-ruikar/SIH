@@ -787,6 +787,25 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    # ── Section 6: Geo DB Status Footer ──
+    try:
+        import geo_asn
+        _g_stat = geo_asn.db_status()
+        _geo_db_label = _g_stat.get("database_in_use")
+        if _geo_db_label and _geo_db_label.lower() != "none":
+            _geo_footer_txt = f"Geo DB: {_geo_db_label}"
+        else:
+            _geo_footer_txt = "Geo DB: none"
+    except Exception:
+        _geo_footer_txt = "Geo DB: none"
+
+    st.markdown(
+        f'<div style="text-align: center; margin-top: 0.8rem; font-size: 0.74rem; color: {p["muted"]};">'
+        f'{_geo_footer_txt}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Data loading & pipeline execution
@@ -1338,6 +1357,212 @@ with tab1:
             st.altair_chart(chart2, width="stretch")
         else:
             st.info("No data to display.")
+
+    # ── Geographic Distribution Section ──
+    st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-title"><span class="icon">🌍</span> Geographic Distribution</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<p style="color:{_cp["muted"]};font-size:0.88rem;margin-bottom:0.75rem;">'
+        'Offline geolocation and Autonomous System (ASN) telemetry breakdown of observed transaction traffic.'
+        '</p>',
+        unsafe_allow_html=True,
+    )
+
+    _geo_world_path = os.path.join("data", "geo", "world-110m.json")
+    _iso_codes_path = os.path.join("data", "geo", "iso_codes.csv")
+
+    _iso_lookup_df = None
+    if os.path.isfile(_iso_codes_path):
+        try:
+            _iso_lookup_df = pd.read_csv(_iso_codes_path)
+        except Exception:
+            _iso_lookup_df = None
+
+    # Country aggregations
+    if "geo_country" in df.columns and total_tx > 0:
+        _country_grp = df.groupby("geo_country").agg(
+            total=("txid", "count"),
+            flagged=("is_anomaly", lambda s: int(s.sum())),
+            avg_risk=("risk_score", "mean"),
+        ).reset_index()
+
+        if _iso_lookup_df is not None:
+            _country_stats = _country_grp.merge(_iso_lookup_df, left_on="geo_country", right_on="iso2", how="inner")
+        else:
+            _country_stats = _country_grp.copy()
+            _country_stats["country_name"] = _country_stats["geo_country"]
+            _country_stats["id"] = 0
+    else:
+        _country_stats = pd.DataFrame(columns=["geo_country", "total", "flagged", "avg_risk", "country_name", "id"])
+
+    # Top 10 Countries Bar Chart data
+    _valid_countries = df[~df["geo_country"].isin(["XX", "", "Unknown", "nan", None])].copy() if "geo_country" in df.columns else pd.DataFrame()
+    if not _valid_countries.empty:
+        _c_top = _valid_countries.groupby("geo_country").agg(
+            flagged=("is_anomaly", lambda s: int(s.sum())),
+            total=("txid", "count"),
+            avg_risk=("risk_score", "mean"),
+        ).reset_index()
+        if _iso_lookup_df is not None:
+            _c_top = _c_top.merge(_iso_lookup_df, left_on="geo_country", right_on="iso2", how="left")
+            _c_top["Country"] = _c_top["country_name"].fillna(_c_top["geo_country"])
+        else:
+            _c_top["Country"] = _c_top["geo_country"]
+        _c_top10 = _c_top.sort_values(["flagged", "total"], ascending=[False, False]).head(10)
+    else:
+        _c_top10 = pd.DataFrame(columns=["Country", "flagged", "total", "avg_risk"])
+
+    # Top 10 ASN Table data
+    if "asn" in df.columns and total_flagged > 0:
+        _asn_flagged = df[df["is_anomaly"] == True].copy()
+        if not _asn_flagged.empty:
+            _asn_top = _asn_flagged.groupby(["asn", "asn_org"], as_index=False).size()
+            _asn_top.columns = ["ASN", "Organisation", "Flagged Count"]
+            _asn_top10 = _asn_top.sort_values("Flagged Count", ascending=False).head(10)
+        else:
+            _asn_top10 = pd.DataFrame(columns=["ASN", "Organisation", "Flagged Count"])
+    else:
+        _asn_top10 = pd.DataFrame(columns=["ASN", "Organisation", "Flagged Count"])
+
+    # Render: Map (if available) + Bar Chart & ASN Table
+    _map_available = os.path.isfile(_geo_world_path) and (_iso_lookup_df is not None)
+
+    if _map_available:
+        geo_col1, geo_col2 = st.columns([3, 2])
+        with geo_col1:
+            st.markdown(
+                '<div style="font-weight:600; font-size:0.95rem; margin-bottom:0.4rem;">🗺️ Global Threat Distribution (Choropleth)</div>',
+                unsafe_allow_html=True,
+            )
+            try:
+                with open(_geo_world_path, "r", encoding="utf-8") as _wf:
+                    _world_topo = json.load(_wf)
+
+                _source = alt.InlineData(
+                    values=_world_topo,
+                    format=alt.DataFormat(type="topojson", feature="countries"),
+                )
+
+                _map_chart = alt.Chart(_source).mark_geoshape(
+                    stroke=_cp.get("chart_grid", "#334155"),
+                    strokeWidth=0.4,
+                ).transform_lookup(
+                    lookup="id",
+                    from_=alt.LookupData(
+                        data=_country_stats,
+                        key="id",
+                        fields=["country_name", "flagged", "total", "avg_risk"],
+                    ),
+                ).encode(
+                    color=alt.Color(
+                        "flagged:Q",
+                        scale=alt.Scale(scheme="reds"),
+                        legend=alt.Legend(
+                            title="Flagged Tx",
+                            labelColor=_cp["chart_text"],
+                            titleColor=_cp["chart_text"],
+                            orient="bottom",
+                        ),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("country_name:N", title="Country"),
+                        alt.Tooltip("total:Q", title="Total Tx"),
+                        alt.Tooltip("flagged:Q", title="Flagged Tx"),
+                        alt.Tooltip("avg_risk:Q", title="Average Risk", format=".1f"),
+                    ],
+                ).project(
+                    type="equalEarth",
+                ).properties(
+                    height=360,
+                ).configure(
+                    background=_cp["chart_bg"],
+                ).configure_view(
+                    strokeWidth=0,
+                )
+
+                st.altair_chart(_map_chart, width="stretch")
+            except Exception as _map_err:
+                st.warning(f"Could not render map: {_map_err}")
+
+            st.markdown(
+                f'<div style="font-size:0.75rem; color:{_cp["muted"]}; margin-top:2px; margin-bottom:0.5rem;">'
+                'IP Geolocation by DB-IP (CC BY 4.0)'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        with geo_col2:
+            st.markdown(
+                '<div style="font-weight:600; font-size:0.95rem; margin-bottom:0.4rem;">🚩 Top 10 Countries by Flagged Tx</div>',
+                unsafe_allow_html=True,
+            )
+            if not _c_top10.empty and _c_top10["flagged"].sum() > 0:
+                _c_bar = alt.Chart(_c_top10).mark_bar(
+                    cornerRadiusTopRight=4,
+                    cornerRadiusBottomRight=4,
+                    color=_cp["accent2"],
+                ).encode(
+                    y=alt.Y("Country:N", sort="-x", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"])),
+                    x=alt.X("flagged:Q", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], gridColor=_cp["chart_grid"]), title="Flagged Tx"),
+                    tooltip=[
+                        alt.Tooltip("Country:N", title="Country"),
+                        alt.Tooltip("flagged:Q", title="Flagged Tx"),
+                        alt.Tooltip("total:Q", title="Total Tx"),
+                        alt.Tooltip("avg_risk:Q", title="Average Risk", format=".1f"),
+                    ],
+                ).properties(height=180).configure(background=_cp["chart_bg"]).configure_view(strokeWidth=0)
+                st.altair_chart(_c_bar, width="stretch")
+            else:
+                st.info("No flagged country anomalies.")
+
+            st.markdown(
+                '<div style="font-weight:600; font-size:0.95rem; margin-top:0.6rem; margin-bottom:0.4rem;">🌐 Top 10 Autonomous Systems (ASNs)</div>',
+                unsafe_allow_html=True,
+            )
+            if not _asn_top10.empty:
+                st.dataframe(_asn_top10, hide_index=True, width="stretch")
+            else:
+                st.info("No ASN telemetry recorded.")
+
+    else:
+        # Fallback when map file is missing: show only bar chart and ASN table
+        geo_col1, geo_col2 = st.columns(2)
+        with geo_col1:
+            st.markdown(
+                '<div style="font-weight:600; font-size:0.95rem; margin-bottom:0.4rem;">🚩 Top 10 Countries by Flagged Tx</div>',
+                unsafe_allow_html=True,
+            )
+            if not _c_top10.empty and _c_top10["flagged"].sum() > 0:
+                _c_bar = alt.Chart(_c_top10).mark_bar(
+                    cornerRadiusTopRight=4,
+                    cornerRadiusBottomRight=4,
+                    color=_cp["accent2"],
+                ).encode(
+                    y=alt.Y("Country:N", sort="-x", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"])),
+                    x=alt.X("flagged:Q", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], gridColor=_cp["chart_grid"]), title="Flagged Tx"),
+                    tooltip=[
+                        alt.Tooltip("Country:N", title="Country"),
+                        alt.Tooltip("flagged:Q", title="Flagged Tx"),
+                        alt.Tooltip("total:Q", title="Total Tx"),
+                        alt.Tooltip("avg_risk:Q", title="Average Risk", format=".1f"),
+                    ],
+                ).properties(height=240).configure(background=_cp["chart_bg"]).configure_view(strokeWidth=0)
+                st.altair_chart(_c_bar, width="stretch")
+            else:
+                st.info("No flagged country anomalies.")
+
+        with geo_col2:
+            st.markdown(
+                '<div style="font-weight:600; font-size:0.95rem; margin-bottom:0.4rem;">🌐 Top 10 Autonomous Systems (ASNs)</div>',
+                unsafe_allow_html=True,
+            )
+            if not _asn_top10.empty:
+                st.dataframe(_asn_top10, hide_index=True, width="stretch")
+            else:
+                st.info("No ASN telemetry recorded.")
 
     # ── Export buttons & Evidence Dossier ──
     st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
