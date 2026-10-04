@@ -130,6 +130,8 @@ THEME_LIGHT = {
     "tab_active_text": "#0D9488",
     "tab_active_border": "#0D9488",
     "tab_text": "#334155",
+    "widget_label_color": "#0F172A",
+    "radio_label_color": "#0F172A",
     "divider": "rgba(15,23,42,0.12)",
     "badge_alpha": "0.12",
     "graph_bgcolor": "#F8FAFC",
@@ -164,7 +166,9 @@ THEME_DARK = {
     "tab_active_bg": "rgba(45,212,191,0.1)",
     "tab_active_text": "#2DD4BF",
     "tab_active_border": "#2DD4BF",
-    "tab_text": "#9DA7B3",
+    "tab_text": "#e2e8f0",
+    "widget_label_color": "#e2e8f0",
+    "radio_label_color": "#e2e8f0",
     "divider": "rgba(45,212,191,0.2)",
     "badge_alpha": "0.15",
     "graph_bgcolor": "#0D1117",
@@ -435,7 +439,7 @@ def _build_css(p: dict) -> str:
     section[data-testid="stSidebar"] .stFileUploader label,
     section[data-testid="stSidebar"] .stToggle label,
     section[data-testid="stSidebar"] summary {{
-        color: var(--text) !important;
+        color: {p['widget_label_color']} !important;
     }}
     section[data-testid="stSidebar"] [data-testid="stFileUploader"] section {{
         background: var(--card) !important;
@@ -451,28 +455,72 @@ def _build_css(p: dict) -> str:
         gap: 0.5rem;
     }}
     .stTabs [data-baseweb="tab"] {{
-        background: {p['tab_bg']};
+        background: {p['tab_bg']} !important;
         border-radius: 0.5rem 0.5rem 0 0;
         border: 1px solid {p['tab_border']};
         border-bottom: none;
         padding: 0.5rem 1.2rem;
-        color: {p['tab_text']};
+        color: {p['tab_text']} !important;
         font-weight: 600;
         font-size: 0.85rem;
     }}
+    .stTabs [data-baseweb="tab"] p,
+    .stTabs [data-baseweb="tab"] span,
+    .stTabs [data-baseweb="tab"] div {{
+        color: {p['tab_text']} !important;
+    }}
     .stTabs [data-baseweb="tab"][aria-selected="true"] {{
-        background: {p['tab_active_bg']};
-        color: {p['tab_active_text']};
-        border-color: {p['tab_active_border']};
+        background: {p['tab_active_bg']} !important;
+        color: {p['tab_active_text']} !important;
+        border-color: {p['tab_active_border']} !important;
+    }}
+    .stTabs [data-baseweb="tab"][aria-selected="true"] p,
+    .stTabs [data-baseweb="tab"][aria-selected="true"] span,
+    .stTabs [data-baseweb="tab"][aria-selected="true"] div {{
+        color: {p['tab_active_text']} !important;
     }}
 
     /* Streamlit dataframe overrides */
     .stDataFrame {{ border-radius: 0.75rem; overflow: hidden; }}
 
     /* ── Streamlit widget text colour overrides ────────────────── */
-    .stSelectbox label, .stMultiSelect label, .stTextInput label,
-    .stTextArea label, .stDateInput label, .stTimeInput label {{
-        color: var(--text) !important;
+    [data-testid="stWidgetLabel"],
+    [data-testid="stWidgetLabel"] label,
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stWidgetLabel"] span,
+    .stSelectbox label, .stSelectbox label p,
+    .stMultiSelect label, .stMultiSelect label p,
+    .stTextInput label, .stTextInput label p,
+    .stTextArea label, .stTextArea label p,
+    .stDateInput label, .stDateInput label p,
+    .stTimeInput label, .stTimeInput label p,
+    .stSlider label, .stSlider label p,
+    .stNumberInput label, .stNumberInput label p,
+    .stFileUploader label, .stFileUploader label p,
+    .stToggle label, .stToggle label p,
+    .stCheckbox label, .stCheckbox label p,
+    .stRadio label, .stRadio label p,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] label,
+    section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+    section[data-testid="stSidebar"] summary {{
+        color: {p['widget_label_color']} !important;
+    }}
+
+    /* ── Radio option labels (sidebar & main) ───────────────────── */
+    [data-testid="stRadio"] [role="radiogroup"] label,
+    [data-testid="stRadio"] [role="radiogroup"] label p,
+    [data-testid="stRadio"] [role="radiogroup"] label span,
+    [data-testid="stRadio"] [data-baseweb="radio"] label,
+    [data-testid="stRadio"] [data-baseweb="radio"] p,
+    [data-testid="stRadio"] [data-baseweb="radio"] span,
+    section[data-testid="stSidebar"] [data-testid="stRadio"] label,
+    section[data-testid="stSidebar"] [data-testid="stRadio"] label p,
+    section[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label,
+    section[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label p,
+    section[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] span,
+    section[data-testid="stSidebar"] [data-testid="stRadio"] [data-baseweb="radio"] p {{
+        color: {p['radio_label_color']} !important;
     }}
     .stMarkdown, .stMarkdown p {{ color: var(--text); }}
 
@@ -865,74 +913,58 @@ def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float, start_time: Opt
 @st.cache_data(show_spinner=False, max_entries=4)
 def run_full_pipeline(file_bytes, file_sha256, contamination, whitelist_sha, watchlist_sha, mode):
     """Unified cached detection pipeline: parse → AI detection → Geo-ASN → Clustering."""
-    print("PIPELINE RUN")
     _parse_start = time.perf_counter()
-    with st.status("Running MITHYA engine...", expanded=True) as status:
-        if status:
-            status.write("Parse")
-        if mode == "separate":
-            if b"\n---SPLIT---\n" in file_bytes:
-                net_bytes, chain_bytes = file_bytes.split(b"\n---SPLIT---\n", 1)
-            elif isinstance(file_bytes, (tuple, list)):
-                net_bytes, chain_bytes = file_bytes[0], file_bytes[1]
-            else:
-                net_bytes, chain_bytes = file_bytes, b""
-            net_df = pd.read_csv(io.BytesIO(net_bytes))
-            chain_df = pd.read_csv(io.BytesIO(chain_bytes))
-            merged, corr_stats = correlate_layers(net_df, chain_df)
-            if "geo_country" not in merged.columns:
-                merged["geo_country"] = "XX"
-            adapter = BitcoinCSVAdapter()
-            if hasattr(adapter, "REQUIRED_COLUMNS"):
-                adapter.REQUIRED_COLUMNS = [c for c in adapter.REQUIRED_COLUMNS if c != "geo_country"]
-            raw_df = adapter._validate_and_build_report(merged, source=None, fmt="CSV (correlated)")
-            if "geo_country" not in raw_df.columns:
-                raw_df["geo_country"] = "XX"
-            adapter.last_report["sha256"] = file_sha256
-            adapter.last_report["correlation"] = corr_stats
+    if mode == "separate":
+        if b"\n---SPLIT---\n" in file_bytes:
+            net_bytes, chain_bytes = file_bytes.split(b"\n---SPLIT---\n", 1)
+        elif isinstance(file_bytes, (tuple, list)):
+            net_bytes, chain_bytes = file_bytes[0], file_bytes[1]
         else:
-            ext = mode if mode.startswith(".") else f".{mode}"
-            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
-            try:
-                adapter = get_adapter(tmp_path)
-                raw_df = adapter.load(tmp_path)
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            corr_stats = None
-
-        if "geo_country" not in raw_df.columns:
-            raw_df["geo_country"] = "XX"
+            net_bytes, chain_bytes = file_bytes, b""
+        net_df = pd.read_csv(io.BytesIO(net_bytes))
+        chain_df = pd.read_csv(io.BytesIO(chain_bytes))
+        merged, corr_stats = correlate_layers(net_df, chain_df)
+        if "geo_country" not in merged.columns:
+            merged["geo_country"] = "XX"
+        adapter = BitcoinCSVAdapter()
         if hasattr(adapter, "REQUIRED_COLUMNS"):
             adapter.REQUIRED_COLUMNS = [c for c in adapter.REQUIRED_COLUMNS if c != "geo_country"]
+        raw_df = adapter._validate_and_build_report(merged, source=None, fmt="CSV (correlated)")
+        if "geo_country" not in raw_df.columns:
+            raw_df["geo_country"] = "XX"
+        adapter.last_report["sha256"] = file_sha256
+        adapter.last_report["correlation"] = corr_stats
+    else:
+        ext = mode if mode.startswith(".") else f".{mode}"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            adapter = get_adapter(tmp_path)
+            raw_df = adapter.load(tmp_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        corr_stats = None
 
-        if status:
-            status.write("Features")
-            status.write("Detect")
-            status.write("Score")
-            status.write("Taint")
-        df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
+    if "geo_country" not in raw_df.columns:
+        raw_df["geo_country"] = "XX"
+    if hasattr(adapter, "REQUIRED_COLUMNS"):
+        adapter.REQUIRED_COLUMNS = [c for c in adapter.REQUIRED_COLUMNS if c != "geo_country"]
 
-        if status:
-            status.write("Geo")
-        if _HAS_GEO_ASN and "src_ip" in df.columns:
-            df = _geo_enrich_df(df, ip_col="src_ip", inplace=False)
-        elif "asn" not in df.columns:
-            df["asn"] = "AS0"
+    df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
 
-        if status:
-            status.write("Clusters")
-        if "behaviour_cluster" not in df.columns or "graph_community" not in df.columns:
-            try:
-                import clustering
-                df, _ = clustering.apply_clustering_to_transactions(df, features_df)
-            except Exception:
-                pass
+    if _HAS_GEO_ASN and "src_ip" in df.columns:
+        df = _geo_enrich_df(df, ip_col="src_ip", inplace=False)
+    elif "asn" not in df.columns:
+        df["asn"] = "AS0"
 
-        if status:
-            status.update(label="MITHYA engine complete", state="complete", expanded=False)
+    if "behaviour_cluster" not in df.columns or "graph_community" not in df.columns:
+        try:
+            import clustering
+            df, _ = clustering.apply_clustering_to_transactions(df, features_df)
+        except Exception:
+            pass
 
     _elapsed = time.perf_counter() - _parse_start
     stats = dict(getattr(adapter, "last_report", None) or {})
@@ -1040,9 +1072,10 @@ else:
             st.stop()
 
 try:
-    df, features_df, stats = run_full_pipeline(
-        file_bytes, file_sha256, contamination, whitelist_sha, watchlist_sha, mode
-    )
+    with st.spinner("🧠 Running MITHYA engine..."):
+        df, features_df, stats = run_full_pipeline(
+            file_bytes, file_sha256, contamination, whitelist_sha, watchlist_sha, mode
+        )
 except Exception as e:
     import traceback
     st.error(f"❌ **Error running pipeline:** {e}\n\n```python\n{traceback.format_exc()}\n```")
