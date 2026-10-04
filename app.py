@@ -23,6 +23,7 @@ import socket
 import hashlib
 from datetime import datetime
 from pathlib import Path
+import io
 from io import StringIO
 from typing import Optional
 
@@ -70,6 +71,7 @@ from ml_engine import (
     load_institutional_whitelist,
     get_adapter,
 )
+from transaction_adapter import BitcoinCSVAdapter, correlate_layers
 
 # ---------------------------------------------------------------------------
 # Page configuration (must be first Streamlit call)
@@ -847,11 +849,6 @@ _default_path = DEFAULT_DATASET if os.path.isfile(DEFAULT_DATASET) else _FALLBAC
 # ── Helper: load separate files and correlate ──
 def _load_separate_files(net_source, chain_source, is_upload=False):
     """Load network + blockchain CSVs, correlate on txid, and return (merged_df, adapter, hash, corr_stats)."""
-    import importlib
-    import transaction_adapter
-    importlib.reload(transaction_adapter)
-    from transaction_adapter import BitcoinCSVAdapter, correlate_layers as _correlate
-
     if is_upload:
         net_bytes = net_source.getvalue()
         chain_bytes = chain_source.getvalue()
@@ -865,7 +862,7 @@ def _load_separate_files(net_source, chain_source, is_upload=False):
         net_df = pd.read_csv(net_source)
         chain_df = pd.read_csv(chain_source)
 
-    merged, corr_stats = _correlate(net_df, chain_df)
+    merged, corr_stats = correlate_layers(net_df, chain_df)
     if "geo_country" not in merged.columns:
         merged["geo_country"] = "XX"
 
