@@ -77,6 +77,7 @@ future ``EthereumAdapter`` requires only changing the instantiation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import mimetypes
@@ -109,6 +110,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import pandas as pd
 
 # pyrefly: ignore [missing-import]
@@ -192,8 +194,120 @@ def _validate_row_count(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# HELPER — Schema normalisation (shared by all adapters)
+# HELPER — Schema normalisation & Ingestion Validation
 # ═══════════════════════════════════════════════════════════════════════════
+
+OPTIONAL_COLUMNS: List[str] = [
+    "src_ip",
+    "dst_ip",
+    "src_port",
+    "dst_port",
+    "fee",
+    "script_type",
+    "geo_country",
+    "asn",
+]
+
+
+class _RejectReasonsDict(dict):
+    """Dictionary supporting case-insensitive, underscore-insensitive, and alias key access."""
+
+    _ALIASES = {
+        "empty_input_or_output_addresses": "empty_addresses",
+        "empty_input_addresses": "empty_addresses",
+        "empty_output_addresses": "empty_addresses",
+        "empty_address": "empty_addresses",
+        "bad_timestamp": "unparseable_timestamp",
+        "bad_timestamps": "unparseable_timestamp",
+        "invalid_timestamp": "unparseable_timestamp",
+        "invalid_timestamps": "unparseable_timestamp",
+        "negative_amounts": "negative_or_non_numeric_amount",
+        "non_numeric_amounts": "negative_or_non_numeric_amount",
+        "negative_or_non_numeric_amounts": "negative_or_non_numeric_amount",
+        "bad_amount": "negative_or_non_numeric_amount",
+        "bad_amounts": "negative_or_non_numeric_amount",
+        "duplicate_txids": "duplicate_txid",
+        "duplicate_tx": "duplicate_txid",
+        "duplicate_txs": "duplicate_txid",
+        "duplicate": "duplicate_txid",
+        "duplicates": "duplicate_txid",
+        "missing_txids": "missing_txid",
+        "missing_tx": "missing_txid",
+    }
+
+    def _resolve(self, key: str) -> str:
+        clean = str(key).lower().replace(" ", "_").replace("-", "_")
+        return self._ALIASES.get(clean, clean)
+
+    def __getitem__(self, key: str) -> int:
+        target = self._resolve(key)
+        for k, v in self.items():
+            if self._resolve(k) == target:
+                return v
+        return 0
+
+    def get(self, key: str, default: Any = 0) -> Any:
+        target = self._resolve(key)
+        for k, v in self.items():
+            if self._resolve(k) == target:
+                return v
+        return default
+
+    def __contains__(self, key: object) -> bool:
+        target = self._resolve(str(key))
+        for k in self.keys():
+            if self._resolve(k) == target:
+                return True
+        return False
+
+
+def _has_addresses(val: Any) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, (list, tuple, set)):
+        return any(str(x).strip() and str(x).strip().lower() not in ("nan", "none", "") for x in val)
+    if pd.isna(val):
+        return False
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return False
+    parts = [p.strip() for p in s.split("|") if p.strip()]
+    return any(p.lower() not in ("nan", "none", "") for p in parts)
+
+
+def _valid_amounts(val: Any) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, (int, float)):
+        return not np.isnan(val) and val >= 0
+    if isinstance(val, (list, tuple, set)):
+        if len(val) == 0:
+            return False
+        for x in val:
+            try:
+                fx = float(x)
+                if np.isnan(fx) or fx < 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+    if pd.isna(val):
+        return False
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return False
+    parts = [p.strip() for p in s.split("|") if p.strip()]
+    if not parts:
+        return False
+    for p in parts:
+        try:
+            fp = float(p)
+            if np.isnan(fp) or fp < 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
 
 def _coerce_to_pipe_str(value: Any) -> str:
     """
@@ -240,11 +354,14 @@ def _normalise_dataframe(df: pd.DataFrame, adapter_name: str) -> pd.DataFrame:
 
     # ── txid ─────────────────────────────────────────────────────
     if "txid" not in df.columns:
-        raise ValueError(
-            f"[{adapter_name}] Loaded data has no 'txid' column — "
-            f"cannot identify transactions.  Available columns: "
-            f"{list(df.columns)}"
-        )
+        if len(df) == 0:
+            df["txid"] = pd.Series(dtype=str)
+        else:
+            raise ValueError(
+                f"[{adapter_name}] Loaded data has no 'txid' column — "
+                f"cannot identify transactions.  Available columns: "
+                f"{list(df.columns)}"
+            )
     df["txid"] = df["txid"].astype(str)
 
     # ── pipe-delimited columns ───────────────────────────────────
@@ -287,6 +404,10 @@ def _normalise_dataframe(df: pd.DataFrame, adapter_name: str) -> pd.DataFrame:
     else:
         df["src_port"] = pd.to_numeric(df["src_port"], errors="coerce").fillna(0).astype(int)
 
+    # ── timestamp ────────────────────────────────────────────────
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
     return df
 
 
@@ -320,6 +441,172 @@ class BaseTransactionAdapter(ABC):
         "input_addresses", "output_addresses",
         "input_amounts", "output_amounts",
     ]
+
+    def __init__(self) -> None:
+        self.last_report: Dict[str, Any] = {
+            "format": self.CHAIN_NAME,
+            "rows_read": 0,
+            "rows_valid": 0,
+            "rows_rejected": 0,
+            "reject_reasons": _RejectReasonsDict(),
+            "duplicate_txids": 0,
+            "columns_found": [],
+            "optional_columns_missing": [],
+            "timestamp_range": [None, None],
+            "sha256": "N/A",
+        }
+
+    def _validate_and_build_report(
+        self,
+        df: pd.DataFrame,
+        source: Any = None,
+        fmt: str = "CSV",
+    ) -> pd.DataFrame:
+        """
+        Validate raw transaction data and populate self.last_report.
+
+        Rejection rules:
+        - Missing txid (empty / NaN / whitespace)
+        - Duplicate txid (keeps first copy, rejects subsequent copies)
+        - Unparseable timestamp (cannot be parsed as datetime)
+        - Empty input or output addresses
+        - Negative or non-numeric amounts
+
+        Returns a normalised canonical DataFrame containing ONLY valid rows.
+        """
+        raw_df = df.copy()
+        rows_read = len(raw_df)
+
+        # 1. SHA-256 calculation
+        sha256 = "N/A"
+        if isinstance(source, (str, os.PathLike)) and os.path.isfile(source):
+            try:
+                with open(source, "rb") as fh:
+                    sha256 = hashlib.sha256(fh.read()).hexdigest()
+            except Exception:
+                pass
+        elif isinstance(source, bytes):
+            sha256 = hashlib.sha256(source).hexdigest()
+        elif hasattr(source, "getvalue"):
+            try:
+                sha256 = hashlib.sha256(source.getvalue()).hexdigest()
+            except Exception:
+                pass
+
+        # 2. Inspect columns
+        columns_found = [str(c) for c in raw_df.columns]
+        optional_columns_missing = [c for c in OPTIONAL_COLUMNS if c not in columns_found]
+
+        # 3. Row-by-row validation & rejection
+        reject_reasons = _RejectReasonsDict()
+        duplicate_txids = 0
+        seen_txids = set()
+        valid_indices = []
+
+        has_txid_col = "txid" in raw_df.columns
+        has_ts_col = "timestamp" in raw_df.columns
+
+        if not has_txid_col and len(raw_df) > 0:
+            raise ValueError(
+                f"[{self.CHAIN_NAME}/{fmt}] Loaded data has no 'txid' column — "
+                f"cannot identify transactions. Available columns: {columns_found}"
+            )
+
+        for idx, row in raw_df.iterrows():
+            # A. Check missing txid
+            txid_val = row["txid"]
+            if txid_val is None or pd.isna(txid_val):
+                reject_reasons["missing_txid"] = reject_reasons.get("missing_txid", 0) + 1
+                continue
+            txid_clean = str(txid_val).strip()
+            if not txid_clean or txid_clean.lower() in ("nan", "none", "null", ""):
+                reject_reasons["missing_txid"] = reject_reasons.get("missing_txid", 0) + 1
+                continue
+
+            # B. Check duplicate txid (keep first copy, reject subsequent copies)
+            if txid_clean in seen_txids:
+                duplicate_txids += 1
+                reject_reasons["duplicate_txid"] = reject_reasons.get("duplicate_txid", 0) + 1
+                continue
+
+            # C. Check unparseable timestamp
+            if has_ts_col:
+                ts_val = row["timestamp"]
+                if ts_val is None or pd.isna(ts_val):
+                    reject_reasons["unparseable_timestamp"] = reject_reasons.get("unparseable_timestamp", 0) + 1
+                    continue
+                ts_str = str(ts_val).strip()
+                if not ts_str or ts_str.lower() in ("nan", "none", "null", "nat", ""):
+                    reject_reasons["unparseable_timestamp"] = reject_reasons.get("unparseable_timestamp", 0) + 1
+                    continue
+                try:
+                    parsed_ts = pd.to_datetime(ts_val)
+                    if pd.isna(parsed_ts):
+                        reject_reasons["unparseable_timestamp"] = reject_reasons.get("unparseable_timestamp", 0) + 1
+                        continue
+                except Exception:
+                    reject_reasons["unparseable_timestamp"] = reject_reasons.get("unparseable_timestamp", 0) + 1
+                    continue
+            # D. Check empty input/output addresses
+            if not _has_addresses(row.get("input_addresses")) or not _has_addresses(row.get("output_addresses")):
+                reject_reasons["empty_addresses"] = reject_reasons.get("empty_addresses", 0) + 1
+                continue
+
+            # E. Check negative or non-numeric amounts
+            if not _valid_amounts(row.get("input_amounts")) or not _valid_amounts(row.get("output_amounts")):
+                reject_reasons["negative_or_non_numeric_amount"] = reject_reasons.get("negative_or_non_numeric_amount", 0) + 1
+                continue
+
+            if "fee" in row and pd.notna(row["fee"]):
+                try:
+                    fee_f = float(row["fee"])
+                    if np.isnan(fee_f) or fee_f < 0:
+                        reject_reasons["negative_or_non_numeric_amount"] = reject_reasons.get("negative_or_non_numeric_amount", 0) + 1
+                        continue
+                except (ValueError, TypeError):
+                    reject_reasons["negative_or_non_numeric_amount"] = reject_reasons.get("negative_or_non_numeric_amount", 0) + 1
+                    continue
+
+            # Passed all checks!
+            seen_txids.add(txid_clean)
+            valid_indices.append(idx)
+
+        valid_df = raw_df.loc[valid_indices].copy()
+        rows_valid = len(valid_df)
+        rows_rejected = rows_read - rows_valid
+
+        # 4. Timestamp range calculation
+        if rows_valid > 0 and has_ts_col:
+            ts_series = pd.to_datetime(valid_df["timestamp"], errors="coerce")
+            min_ts = ts_series.min()
+            max_ts = ts_series.max()
+            if pd.notna(min_ts) and pd.notna(max_ts):
+                timestamp_range = [str(min_ts)[:19], str(max_ts)[:19]]
+            else:
+                timestamp_range = [None, None]
+        else:
+            timestamp_range = [None, None]
+
+        # 5. Populate self.last_report
+        self.last_report = {
+            "format": fmt,
+            "rows_read": rows_read,
+            "rows_valid": rows_valid,
+            "rows_rejected": rows_rejected,
+            "reject_reasons": reject_reasons,
+            "duplicate_txids": duplicate_txids,
+            "columns_found": columns_found,
+            "optional_columns_missing": optional_columns_missing,
+            "timestamp_range": timestamp_range,
+            "sha256": sha256,
+        }
+
+        logger.info(
+            "[%s] Ingestion report: read=%d, valid=%d, rejected=%d, dups=%d",
+            fmt, rows_read, rows_valid, rows_rejected, duplicate_txids,
+        )
+
+        return _normalise_dataframe(valid_df, f"{self.CHAIN_NAME}/{fmt}")
 
     # ──────────────────────────────────────────────────────────────
     # Abstract interface
@@ -438,6 +725,9 @@ class BaseTransactionAdapter(ABC):
         # 5. Extract features (chain-specific)
         features, df = self.extract_features(df)
 
+        # 5a. Detector-based structural classification (replaces label leakage)
+        df["detected_type"] = ml_engine.classify_structural_type(df, features)
+
         # 6–8. Train → Score → Explain  (chain-agnostic core)
         model, predictions, raw_scores = ml_engine.train_model(
             features, contamination=contamination,
@@ -453,6 +743,45 @@ class BaseTransactionAdapter(ABC):
 
         # 9. Institutional whitelist
         enriched_df = ml_engine.apply_institutional_whitelist(enriched_df)
+
+        # 9a. Finalize detected_type (whitelist override for benign types)
+        ml_engine.finalize_detected_type(enriched_df)
+
+        # 9b. Watchlist & taint propagation
+        _wl = ml_engine.load_watchlist()
+        ml_engine.apply_watchlist(enriched_df, _wl)
+        ml_engine.compute_taint(enriched_df, _wl)
+
+        # 9c. Supervised ML probability (if attack_type is present)
+        if "attack_type" in enriched_df.columns and "ml_probability" not in enriched_df.columns:
+            try:
+                X_inf = ml_engine.select_informative_features(features)
+                y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
+                from sklearn.ensemble import RandomForestClassifier
+                from sklearn.calibration import CalibratedClassifierCV
+                from sklearn.model_selection import StratifiedKFold, cross_val_predict
+                _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=-1)
+                _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
+                _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+                _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=-1)[:, 1]
+                enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+            except Exception as _e:
+                ml_engine._log(f"[!] Supervised cross-val scoring note: {_e}")
+
+        # 9c. Fused multi-signal priority score
+        ml_engine.compute_fused_priority(enriched_df, features)
+
+        # 9c. Assign categorical risk tiers
+        enriched_df["risk_tier"] = enriched_df["risk_score"].apply(
+            ml_engine.assign_risk_tier
+        )
+
+        # 9d. Behavioural clustering & graph communities
+        try:
+            import clustering
+            enriched_df, _ = clustering.apply_clustering_to_transactions(enriched_df, features)
+        except Exception as _cl_err:
+            ml_engine._log(f"[!] Clustering & communities note: {_cl_err}")
 
         # 10. Offline Geo-ASN enrichment (strict: XX/AS0 if no DB)
         try:
@@ -559,7 +888,7 @@ class BitcoinCSVAdapter(BaseTransactionAdapter):
             self.CHAIN_NAME, len(df), list(df.columns),
         )
 
-        return _normalise_dataframe(df, f"{self.CHAIN_NAME}/CSV")
+        return self._validate_and_build_report(df, source=filepath, fmt="CSV")
 
     def load_data(self, source: str | pd.DataFrame) -> pd.DataFrame:
         """
@@ -568,17 +897,22 @@ class BitcoinCSVAdapter(BaseTransactionAdapter):
         import ml_engine
 
         if isinstance(source, pd.DataFrame):
-            df = source.copy()
+            if self.last_report.get("rows_read", 0) == 0:
+                df = self._validate_and_build_report(source, source=source, fmt="CSV")
+            else:
+                df = source.copy()
             ml_engine._log(
                 f"[*] [{self.CHAIN_NAME}] Received DataFrame with "
                 f"{len(df)} transactions"
             )
-        elif isinstance(source, str) and os.path.isfile(source):
-            df = pd.read_csv(source, parse_dates=["timestamp"])
+            return df
+        elif isinstance(source, (str, os.PathLike)) and os.path.isfile(str(source)):
+            df = self.load(str(source))
             ml_engine._log(
                 f"[*] [{self.CHAIN_NAME}] Loaded {len(df)} transactions "
                 f"from {source}"
             )
+            return df
         else:
             raise FileNotFoundError(
                 f"[{self.CHAIN_NAME}] Source not found: {source}"
@@ -736,7 +1070,7 @@ class BitcoinJSONAdapter(BaseTransactionAdapter):
             self.CHAIN_NAME, len(df), list(df.columns),
         )
 
-        return _normalise_dataframe(df, f"{self.CHAIN_NAME}/JSON")
+        return self._validate_and_build_report(df, source=filepath, fmt="JSON")
 
     # ── Internal: JSON structure detection ────────────────────────
 
@@ -809,41 +1143,18 @@ class BitcoinJSONAdapter(BaseTransactionAdapter):
         import ml_engine
 
         if isinstance(source, pd.DataFrame):
-            df = source.copy()
+            if self.last_report.get("rows_read", 0) == 0:
+                df = self._validate_and_build_report(source, source=source, fmt="JSON")
+            else:
+                df = source.copy()
             ml_engine._log(
                 f"[*] [{self.CHAIN_NAME}/JSON] Received DataFrame with "
                 f"{len(df)} transactions"
             )
             return df
 
-        if isinstance(source, str) and os.path.isfile(source):
-            # Delegate to the canonical load() method and return the
-            # full DataFrame (which may contain more columns than the
-            # canonical set — e.g. timestamp, src_ip, etc.).
-            try:
-                with open(source, "r", encoding="utf-8") as fh:
-                    raw = json.load(fh)
-            except (json.JSONDecodeError, OSError) as exc:
-                raise ValueError(
-                    f"[{self.CHAIN_NAME}/JSON] Failed to read '{source}': "
-                    f"{exc}"
-                ) from exc
-
-            records = self._json_to_records(raw, source)
-            df = pd.DataFrame(records)
-
-            # Normalise pipe-delimited columns
-            for col in ("input_addresses", "output_addresses",
-                        "input_amounts", "output_amounts"):
-                if col in df.columns:
-                    df[col] = df[col].apply(_coerce_to_pipe_str)
-
-            # Parse timestamp if present
-            if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(
-                    df["timestamp"], errors="coerce",
-                )
-
+        if isinstance(source, (str, os.PathLike)) and os.path.isfile(str(source)):
+            df = self.load(str(source))
             ml_engine._log(
                 f"[*] [{self.CHAIN_NAME}/JSON] Loaded {len(df)} "
                 f"transactions from {source}"
@@ -993,7 +1304,7 @@ class BitcoinXMLAdapter(BaseTransactionAdapter):
             self.CHAIN_NAME, len(df), list(df.columns),
         )
 
-        return _normalise_dataframe(df, f"{self.CHAIN_NAME}/XML")
+        return self._validate_and_build_report(df, source=filepath, fmt="XML")
 
     # ── Internal: XML parsing ─────────────────────────────────────
 
@@ -1090,49 +1401,18 @@ class BitcoinXMLAdapter(BaseTransactionAdapter):
         import ml_engine
 
         if isinstance(source, pd.DataFrame):
-            df = source.copy()
+            if self.last_report.get("rows_read", 0) == 0:
+                df = self._validate_and_build_report(source, source=source, fmt="XML")
+            else:
+                df = source.copy()
             ml_engine._log(
                 f"[*] [{self.CHAIN_NAME}/XML] Received DataFrame with "
                 f"{len(df)} transactions"
             )
             return df
 
-        if isinstance(source, str) and os.path.isfile(source):
-            try:
-                tree = ET.parse(source)
-            except ET.ParseError as exc:
-                raise ValueError(
-                    f"[{self.CHAIN_NAME}/XML] Malformed XML in "
-                    f"'{source}': {exc}"
-                ) from exc
-
-            root = tree.getroot()
-            records = self._parse_transactions(root, source)
-            df = pd.DataFrame(records)
-
-            # Normalise pipe-delimited columns
-            for col in ("input_addresses", "output_addresses",
-                        "input_amounts", "output_amounts"):
-                if col in df.columns:
-                    df[col] = df[col].apply(_coerce_to_pipe_str)
-
-            # Parse timestamp if present
-            if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(
-                    df["timestamp"], errors="coerce",
-                )
-
-            # Ensure numeric types for port / fee columns
-            for col in ("src_port", "dst_port"):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(
-                        df[col], errors="coerce",
-                    ).fillna(0).astype(int)
-            if "fee" in df.columns:
-                df["fee"] = pd.to_numeric(
-                    df["fee"], errors="coerce",
-                ).fillna(_DEFAULT_FEE)
-
+        if isinstance(source, (str, os.PathLike)) and os.path.isfile(str(source)):
+            df = self.load(str(source))
             ml_engine._log(
                 f"[*] [{self.CHAIN_NAME}/XML] Loaded {len(df)} "
                 f"transactions from {source}"

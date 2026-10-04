@@ -90,8 +90,9 @@ class TestOneSideWhitelisted:
         )
         result = apply_institutional_whitelist(df, whitelist=WHITELIST_ADDRS, labels=LABELS)
 
-        expected = round(original_risk * 0.15, 2)
-        assert result.at[0, "risk_score"] == expected
+        # risk_score is no longer modified here — discount is applied
+        # downstream by compute_fused_priority via whitelist_factor.
+        assert result.at[0, "risk_score"] == original_risk
         # Anomaly flag is preserved — the unverified side is still suspicious
         assert result.at[0, "is_anomaly"] == True
         assert result.at[0, "whitelisted_side"] == "input"
@@ -106,8 +107,8 @@ class TestOneSideWhitelisted:
         )
         result = apply_institutional_whitelist(df, whitelist=WHITELIST_ADDRS, labels=LABELS)
 
-        expected = round(original_risk * 0.15, 2)
-        assert result.at[0, "risk_score"] == expected
+        # risk_score preserved — discount via whitelist_factor downstream
+        assert result.at[0, "risk_score"] == original_risk
         assert result.at[0, "is_anomaly"] == True
         assert result.at[0, "whitelisted_side"] == "output"
         assert result.at[0, "whitelisted_entity"] == "Kraken"
@@ -122,8 +123,8 @@ class TestOneSideWhitelisted:
         )
         result = apply_institutional_whitelist(df, whitelist=WHITELIST_ADDRS, labels=LABELS)
 
-        expected = round(original_risk * 0.15, 2)
-        assert result.at[0, "risk_score"] == expected
+        # risk_score preserved — discount via whitelist_factor downstream
+        assert result.at[0, "risk_score"] == original_risk
         assert result.at[0, "whitelisted_side"] == "input"
 
 

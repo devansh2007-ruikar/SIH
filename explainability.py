@@ -11,7 +11,7 @@ Architecture
 The explanation engine operates in two phases:
 
 **Phase A — Direct Signal Detection:**
-Checks raw transaction fields (port numbers, fee, amounts, attack_type,
+Checks raw transaction fields (port numbers, fee, amounts, detected_type,
 addresses) against forensic rule-triggers. These produce crisp,
 domain-specific statements like:
     "Routed through known Tor SOCKS port (9050)."
@@ -305,14 +305,14 @@ def _detect_direct_signals(
         )
 
     # ── 2. Mixer/CoinJoin signature ───────────────────────────────────
-    attack_type = str(original_row.get("attack_type", ""))
-    if "CoinJoin" in attack_type or "Mixer" in attack_type:
+    detected_type = str(original_row.get("detected_type", ""))
+    if "CoinJoin" in detected_type or "Mixer" in detected_type:
         signals.append(
             "Matches deterministic equal-denomination CoinJoin signature"
         )
 
     # ── 3. Fee spike ──────────────────────────────────────────────────
-    if "Fee_Spike" in attack_type or "Fee" in attack_type:
+    if "Fee_Spike" in detected_type or "Fee" in detected_type:
         fee = float(original_row.get("fee", 0))
         total = float(original_row.get("total_amount_btc", 0))
         if total > 0:
@@ -327,7 +327,7 @@ def _detect_direct_signals(
             )
 
     # ── 4. Peel chain ─────────────────────────────────────────────────
-    if "Peel" in attack_type:
+    if "Peel" in detected_type:
         disparity = float(row_features.get("peel_chain_disparity", 0))
         if disparity > 0:
             signals.append(
@@ -658,7 +658,7 @@ def generate_explanation(
     deviation_score : float
         Anomaly Deviation Score (0–100).
     original_row : pd.Series
-        The original transaction row (src_port, fee, attack_type, etc.)
+        The original transaction row (src_port, fee, detected_type, etc.)
     profile : DatasetProfile
         Pre-computed dataset-level statistics.
 
@@ -704,7 +704,13 @@ def generate_explanation(
         fallback = _fallback_max_deviation(row_features, profile)
         reasons.append(fallback)
 
-    return "Anomaly indicators: " + "; ".join(reasons) + "."
+    expl = "Anomaly indicators: " + "; ".join(reasons) + "."
+    if str(original_row.get("behaviour_cluster")) == "Behavioural outlier":
+        outlier_text = "Entity behaves unlike every known group (HDBSCAN outlier)."
+        if outlier_text not in expl:
+            expl += f" {outlier_text}"
+
+    return expl
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -767,7 +773,10 @@ def generate_all_explanations(
             telem = generate_telemetry(feat_row, profile)
             telemetry_col.append(json.dumps(telem, default=str))
         else:
-            explanations.append("Normal.")
+            exp = "Normal."
+            if str(row.get("behaviour_cluster")) == "Behavioural outlier":
+                exp += " Entity behaves unlike every known group (HDBSCAN outlier)."
+            explanations.append(exp)
             telemetry_col.append(None)
 
     result["explanation"] = explanations

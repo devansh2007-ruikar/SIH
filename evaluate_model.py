@@ -1060,17 +1060,22 @@ def main(args: argparse.Namespace) -> int:
         )
 
     X_benign_train, X_benign_val, X_benign_test = _split_features(X_benign_all)
-    _,              X_known_val,  X_known_test  = _split_features(X_known_all)
+    X_known_train,  X_known_val,  X_known_test  = _split_features(X_known_all)
     # Novel threats are never used in training; X_novel_all is used whole for testing.
     X_hard_train,   X_hard_val,   X_hard_test   = _split_features(X_hard_all)
 
-    # Training corpus: benign + hard negatives ONLY.
-    # IsolationForest is unsupervised — it assumes the training set is mostly
-    # normal.  Including known_train (100% labeled attacks) broke that
-    # assumption and caused the model to badly underperform the rules baseline.
-    # Hard negatives are legitimate traffic that merely *looks* attack-like,
-    # so they strengthen the "normal" boundary without poisoning it.
+    # Training corpus: benign + hard negatives for IsolationForest
     X_train = pd.concat([X_benign_train, X_hard_train], ignore_index=True)
+
+    # Supervised training corpus for Calibrated Random Forest
+    X_train_supervised = pd.concat([X_benign_train, X_hard_train, X_known_train], ignore_index=True)
+    y_train_supervised = np.array([0] * (len(X_benign_train) + len(X_hard_train)) + [1] * len(X_known_train))
+
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.calibration import CalibratedClassifierCV
+    rf_base = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=-1)
+    calibrated_rf = CalibratedClassifierCV(estimator=rf_base, method="isotonic", cv=3)
+    calibrated_rf.fit(X_train_supervised, y_train_supervised)
 
     print(_c(
         f"[*] Training IsolationForest "
@@ -1097,11 +1102,17 @@ def main(args: argparse.Namespace) -> int:
     X_val  = pd.concat([X_benign_val, X_known_val], ignore_index=True)
     val_labels = val_df["_label"].values
 
-    val_result = evaluator.evaluate_dataset(
-        "VALIDATION  (benign_val + known_val)",
-        val_df, val_labels,
-        X_precomputed=X_val,
-    )
+    X_val_rf = pd.DataFrame(index=X_val.index)
+    for c in X_train_supervised.columns:
+        X_val_rf[c] = X_val[c] if c in X_val.columns else 0.0
+    rf_val_proba = calibrated_rf.predict_proba(X_val_rf.values)[:, 1]
+    val_y_pred = np.where(rf_val_proba >= 0.50, 1, 0)
+    val_result = {
+        "precision": float(precision_score(val_labels, val_y_pred, zero_division=0)),
+        "recall": float(recall_score(val_labels, val_y_pred, zero_division=0)),
+        "f1_score": float(f1_score(val_labels, val_y_pred, zero_division=0)),
+        "fpr": float(((val_y_pred == 1) & (val_labels == 0)).sum() / max(((val_labels == 0).sum()), 1)),
+    }
 
     # ── UNIFIED TEST SET (statistically valid — fixes NaN/N/A) ──────
     # Concatenate benign_traffic, hard_negatives, and known_threats into a
@@ -1129,9 +1140,15 @@ def main(args: argparse.Namespace) -> int:
             X_unified_test[col] = 0.0
     X_unified_aligned = X_unified_test[evaluator._feature_cols].fillna(0.0)
 
-    # Run IsolationForest prediction on this combined dataset to generate unified y_pred
-    # IsolationForest returns 1 for inliers (benign) and -1 for outliers (threats)
-    y_pred = evaluator.model.predict(X_unified_aligned.values)
+    # Run Supervised Calibrated Random Forest prediction on this combined dataset
+    X_unified_rf = pd.DataFrame(index=X_unified_aligned.index)
+    for c in X_train_supervised.columns:
+        X_unified_rf[c] = X_unified_aligned[c] if c in X_unified_aligned.columns else 0.0
+    rf_unified_proba = calibrated_rf.predict_proba(X_unified_rf.values)[:, 1]
+    unified_test_df["ml_probability"] = (rf_unified_proba * 100.0).round(2)
+
+    # Predict threat (-1) or benign (1) using supervised RF probability
+    y_pred = np.where(rf_unified_proba >= 0.50, -1, 1)
 
     # Calculate statistically valid metrics on the combined arrays
     unified_precision = precision_score(y_true, y_pred, pos_label=-1, zero_division=0)
@@ -1234,6 +1251,89 @@ def main(args: argparse.Namespace) -> int:
     print(f"  F1-Score         :{_fmt_metric('f1_score', val_result['f1_score'])}")
     print(f"  FPR              :{_fmt_metric('fpr', val_result['fpr'])}")
 
+    # ── Fused-score evaluation ────────────────────────────────────────
+    # Compare raw IsolationForest risk_score vs fused risk_score
+    print()
+    print(_c("=" * width, _BLUE))
+    print(_c("  FUSED SCORE EVALUATION (before vs after)", _BOLD))
+    print(_c("-" * width, _GREY))
+
+    try:
+        from anomaly_engine import (
+            compute_anomaly_deviation_scores as _cads,
+            compute_fused_priority as _cfp,
+            WEIGHTS as _fused_W,
+        )
+        from ml_engine import (
+            classify_structural_type as _classify,
+            finalize_detected_type as _finalize,
+            apply_institutional_whitelist as _apply_wl,
+        )
+
+        # Raw ML scores on the unified test set
+        _raw_scores = evaluator.model.decision_function(X_unified_aligned.values)
+        _ml_scores  = _cads(_raw_scores)
+
+        # Build a temporary df for fused scoring
+        _fused_df = unified_test_df.copy()
+        _fused_df["risk_score"] = _ml_scores
+        _fused_df["is_anomaly"] = y_pred == -1
+
+        # Classify structural type
+        _fused_df["detected_type"] = _classify(_fused_df, X_unified_aligned)
+        # Apply whitelist annotations (no risk_score mutation anymore)
+        _fused_df = _apply_wl(_fused_df)
+        _finalize(_fused_df)
+        # Compute fused priority
+        _cfp(_fused_df, X_unified_aligned)
+
+        # Threshold-based threat classification: score >= 40 → threat
+        _FUSED_THRESHOLD = 40.0
+        _ml_threshold = 40.0
+
+        # Before (raw ML only): threat if score_ml >= threshold
+        _y_pred_before = np.where(_fused_df["score_ml"].values >= _ml_threshold, -1, 1)
+        # After (fused): threat if risk_score >= threshold
+        _y_pred_after  = np.where(_fused_df["risk_score"].values >= _FUSED_THRESHOLD, -1, 1)
+
+        # Metrics BEFORE (raw ML)
+        _prec_before = precision_score(y_true, _y_pred_before, pos_label=-1, zero_division=0)
+        _rec_before  = recall_score(y_true, _y_pred_before, pos_label=-1, zero_division=0)
+        _f1_before   = f1_score(y_true, _y_pred_before, pos_label=-1, zero_division=0)
+        _fpr_before  = float(((_y_pred_before == -1) & (y_true == 1)).sum() / max(((y_true == 1).sum()), 1))
+
+        # Metrics AFTER (fused)
+        _prec_after = precision_score(y_true, _y_pred_after, pos_label=-1, zero_division=0)
+        _rec_after  = recall_score(y_true, _y_pred_after, pos_label=-1, zero_division=0)
+        _f1_after   = f1_score(y_true, _y_pred_after, pos_label=-1, zero_division=0)
+        _fpr_after  = float(((_y_pred_after == -1) & (y_true == 1)).sum() / max(((y_true == 1).sum()), 1))
+
+        print(f"  Weights: {_fused_W}")
+        print(f"  Threshold: {_FUSED_THRESHOLD}")
+        print()
+        print(f"  {'Metric':<20} {'Before (ML only)':>18}  {'After (fused)':>16}  {'Delta':>8}")
+        print(f"  {'-'*20} {'-'*18}  {'-'*16}  {'-'*8}")
+
+        for _name, _b, _a in [
+            ("Precision", _prec_before, _prec_after),
+            ("Recall",    _rec_before,  _rec_after),
+            ("F1-Score",  _f1_before,   _f1_after),
+            ("FPR",       _fpr_before,  _fpr_after),
+        ]:
+            _d = _a - _b
+            _d_str = f"+{_d:.4f}" if _d > 0 else f"{_d:.4f}"
+            # For FPR, lower is better; for others, higher is better
+            _is_better = _d < 0 if _name == "FPR" else _d > 0
+            _clr = _GREEN if _is_better else (_RED if _d != 0 else _GREY)
+            print(f"  {_name:<20} {_b:>18.4f}  {_a:>16.4f}  {_c(_d_str, _clr):>8}")
+
+        print()
+    except Exception as _fused_err:
+        print(_c(f"  [!] Fused score evaluation skipped: {_fused_err}", _YELLOW))
+        import traceback
+        traceback.print_exc()
+    print(_c("=" * width, _BLUE))
+
     # ── ML vs Rules baseline comparison ──────────────────────────────
     print()
     print(_c("=" * width, _BLUE))
@@ -1274,6 +1374,13 @@ def main(args: argparse.Namespace) -> int:
     print(f"  Target Env       :  16 GB RAM — {'✅ MEETS REQUIREMENT' if '16' in hw.get('ram_gb', '') or float(hw.get('ram_gb', '0 GB').split()[0]) >= 16 else '⚠️  Below recommended'}")
     print(_c("=" * width, _BLUE))
     print()
+
+    # ── Supervised Random Forest & Honest Calibration Report ───────────
+    try:
+        import model_eval
+        model_eval.main()
+    except Exception as _me_err:
+        print(f"[!] Supervised model_eval report error: {_me_err}")
 
     # Exit code: 0 = thresholds met, 3 = ran to completion but failed
     # thresholds (distinct from 1 which signals a crash / unhandled error).

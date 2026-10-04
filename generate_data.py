@@ -41,6 +41,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from xml.dom import minidom
 
+import numpy as np
 import pandas as pd
 # pyrefly: ignore [missing-import]
 from faker import Faker
@@ -568,32 +569,122 @@ def export_xml_sample(df: pd.DataFrame, filepath: str, n: int = 50):
         f.write(pretty)
     print(f"[*] Exported {len(sample)} sample records → '{filepath}'")
 
+# ---------------------------------------------------------------------------
+# Watchlist Generation (demo threat intel)
+# ---------------------------------------------------------------------------
+WATCHLIST_CSV = os.path.join("sample_data", "watchlist.csv")
+
+
+def generate_watchlist_csv(df: pd.DataFrame):
+    """
+    Generate a demo known-bad watchlist from the synthetic dataset.
+
+    This is synthetic threat intelligence for testing/demo purposes only.
+    In production, this would come from OFAC, FinCEN, or commercial
+    threat-intel feeds.
+
+    Picks:
+    - 3 input addresses from first-hop peel chains (Ransomware_Payout)
+    - 2 input addresses from CoinJoin txs (Sanctioned_Mixer_User)
+    - 3 src_ip values from Fee_Spike txs (Tor_Exit_Node)
+    - 2 made-up ASNs (Bulletproof_Hosting)
+    """
+    rows = []
+
+    # ── 3 peel chain first-hop input addresses ──
+    peel_df = df[df["attack_type"] == "Peel_Chain"].copy()
+    if "hop_index" in peel_df.columns:
+        first_hops = peel_df[peel_df["hop_index"] == 0]
+    else:
+        first_hops = peel_df.head(10)
+
+    # Pick from distinct chains
+    if "chain_id" in first_hops.columns:
+        distinct_chains = first_hops.drop_duplicates(subset="chain_id")
+    else:
+        distinct_chains = first_hops
+
+    peel_picks = distinct_chains.head(3)
+    for _, row in peel_picks.iterrows():
+        addrs = str(row.get("input_addresses", "")).split("|")
+        if addrs and addrs[0].strip():
+            rows.append({
+                "indicator": addrs[0].strip(),
+                "type": "address",
+                "label": "Ransomware_Payout",
+                "severity": 1.0,
+            })
+
+    # ── 2 CoinJoin input addresses ──
+    cj_df = df[df["attack_type"] == "CoinJoin_Mixer"].head(5)
+    cj_count = 0
+    for _, row in cj_df.iterrows():
+        if cj_count >= 2:
+            break
+        addrs = str(row.get("input_addresses", "")).split("|")
+        if addrs and addrs[0].strip():
+            rows.append({
+                "indicator": addrs[0].strip(),
+                "type": "address",
+                "label": "Sanctioned_Mixer_User",
+                "severity": 0.8,
+            })
+            cj_count += 1
+
+    # ── 3 src_ip values from Fee_Spike rows ──
+    fs_df = df[df["attack_type"] == "Fee_Spike"].head(5)
+    fs_count = 0
+    seen_ips = set()
+    for _, row in fs_df.iterrows():
+        if fs_count >= 3:
+            break
+        ip = str(row.get("src_ip", "")).strip()
+        if ip and ip not in seen_ips and ip != "nan":
+            rows.append({
+                "indicator": ip,
+                "type": "ip",
+                "label": "Tor_Exit_Node",
+                "severity": 0.6,
+            })
+            seen_ips.add(ip)
+            fs_count += 1
+
+    # ── 2 made-up ASNs (Bulletproof_Hosting) ──
+    rows.append({"indicator": "AS63949", "type": "asn", "label": "Bulletproof_Hosting", "severity": 0.5})
+    rows.append({"indicator": "AS44477", "type": "asn", "label": "Bulletproof_Hosting", "severity": 0.5})
+
+    os.makedirs("sample_data", exist_ok=True)
+    wl_df = pd.DataFrame(rows)
+    wl_df.to_csv(WATCHLIST_CSV, index=False)
+    print(f"[*] Generated {WATCHLIST_CSV} with {len(wl_df)} demo threat-intel indicators.")
+
 
 # ---------------------------------------------------------------------------
 # Pipeline Execution
 # ---------------------------------------------------------------------------
-def main(
+def generate_transactions_df(
     total_records: int = TOTAL_RECORDS,
     suspicious_ratio: float = SUSPICIOUS_RATIO,
     peel_depth_min: int = PEEL_CHAIN_DEPTH_MIN,
     peel_depth_max: int = PEEL_CHAIN_DEPTH_MAX,
-    output_csv: str = OUTPUT_CSV,
     terminal_to_exchange: bool = True,
-):
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """
+    Generate synthetic transactions directly into an in-memory DataFrame.
+    """
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        try:
+            fake.seed_instance(seed)
+        except Exception:
+            pass
+
     num_suspicious = int(total_records * suspicious_ratio)
     num_normal = total_records - num_suspicious
 
-    print(f"[*] Initializing Synthetic Data Generator (Records: {total_records})")
-    print(f"    Peel chain depth: {peel_depth_min}–{peel_depth_max} hops")
-
-    # 1. Generate Whitelist
-    generate_whitelist_csv()
-
-    # 2. Generate Transactions
     transactions: List[dict] = []
-    peel_chains_generated = 0
-
-    # ── Generate Suspicious — distribute across 4 threat vectors ──
     suspicious_generated = 0
     while suspicious_generated < num_suspicious:
         roll = random.random()
@@ -603,7 +694,6 @@ def main(
             suspicious_generated += 1
 
         elif roll < 0.50:
-            # Multi-hop peel chain: generates multiple linked records
             chain = create_peel_chain_sequence(
                 depth_min=peel_depth_min,
                 depth_max=peel_depth_max,
@@ -611,7 +701,6 @@ def main(
             )
             transactions.extend(chain)
             suspicious_generated += len(chain)
-            peel_chains_generated += 1
 
         elif roll < 0.75:
             transactions.append(create_fanout_dispersal())
@@ -621,18 +710,41 @@ def main(
             transactions.append(create_fee_spike())
             suspicious_generated += 1
 
-    # ── Generate Normal (Standard and Institutional) ──
     for _ in range(num_normal):
         if random.random() < 0.15:
             transactions.append(create_institutional_transfer())
         else:
             transactions.append(create_normal_traffic())
 
-    # 3. Shuffle and Save
     random.shuffle(transactions)
     df = pd.DataFrame(transactions)
     df.sort_values(by="timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def main(
+    total_records: int = TOTAL_RECORDS,
+    suspicious_ratio: float = SUSPICIOUS_RATIO,
+    peel_depth_min: int = PEEL_CHAIN_DEPTH_MIN,
+    peel_depth_max: int = PEEL_CHAIN_DEPTH_MAX,
+    output_csv: str = OUTPUT_CSV,
+    terminal_to_exchange: bool = True,
+):
+    print(f"[*] Initializing Synthetic Data Generator (Records: {total_records})")
+    print(f"    Peel chain depth: {peel_depth_min}–{peel_depth_max} hops")
+
+    # 1. Generate Whitelist
+    generate_whitelist_csv()
+
+    # 2. Generate Transactions
+    df = generate_transactions_df(
+        total_records=total_records,
+        suspicious_ratio=suspicious_ratio,
+        peel_depth_min=peel_depth_min,
+        peel_depth_max=peel_depth_max,
+        terminal_to_exchange=terminal_to_exchange,
+    )
 
     df.to_csv(output_csv, index=False)
 
@@ -660,6 +772,9 @@ def main(
     xml_path = os.path.splitext(output_csv)[0] + "_sample.xml"
     export_json_sample(df, json_path)
     export_xml_sample(df, xml_path)
+
+    # 5. Generate demo threat-intel watchlist (known-bad indicators)
+    generate_watchlist_csv(df)
 
     print(f"\n-----------------\n[✓] Done.")
 

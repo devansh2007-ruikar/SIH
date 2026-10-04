@@ -627,6 +627,17 @@ with st.sidebar:
     else:
         st.info("📄 Currently using default: **institutional_whitelist.csv**")
 
+    uploaded_watchlist = st.file_uploader(
+        "Upload Watchlist CSV",
+        type=["csv"],
+        help="CSV with columns: indicator, type, label, severity",
+        key="watchlist_upload",
+    )
+    if uploaded_watchlist:
+        st.info(f"✅ Currently using: **{uploaded_watchlist.name}**")
+    else:
+        st.info("📄 Currently using default: **sample_data/watchlist.csv**")
+
     st.markdown("---")
 
     # ── Section 2: Model Controls ──
@@ -685,7 +696,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Section 4: Whitelist Viewer ──
+    # ── Section 4: Whitelist & Watchlist Viewers ──
     with st.expander("🏛️ Active Institutional Whitelist"):
         try:
             wl_addrs, wl_labels = load_institutional_whitelist()
@@ -699,6 +710,26 @@ with st.sidebar:
                 st.info("No whitelist loaded.")
         except Exception:
             st.info("Whitelist file not found.")
+
+    with st.expander("🚫 Active Watchlist"):
+        try:
+            from ml_engine import load_watchlist
+            wl_data = load_watchlist()
+            all_entries = []
+            for t, entries in wl_data.items():
+                for e in entries:
+                    all_entries.append({
+                        "Indicator": e.get("indicator", ""),
+                        "Type": t,
+                        "Label": e.get("label", ""),
+                        "Severity": e.get("severity", 0.0),
+                    })
+            if all_entries:
+                st.dataframe(pd.DataFrame(all_entries), hide_index=True, use_container_width=True)
+            else:
+                st.info("No watchlist loaded.")
+        except Exception:
+            st.info("Watchlist file not found.")
 
     # ── Section 5: Info ──
     st.markdown(
@@ -729,6 +760,12 @@ if uploaded_whitelist is not None:
     custom_wl = pd.read_csv(uploaded_whitelist)
     custom_wl.to_csv("institutional_whitelist.csv", index=False)
 
+# Handle custom watchlist upload
+if uploaded_watchlist is not None:
+    custom_wl_bad = pd.read_csv(uploaded_watchlist)
+    os.makedirs("sample_data", exist_ok=True)
+    custom_wl_bad.to_csv(os.path.join("sample_data", "watchlist.csv"), index=False)
+
 
 def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
     """Run the full AI pipeline via the polymorphic adapter, then enrich with offline Geo-ASN."""
@@ -740,6 +777,15 @@ def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
         enriched_df = _geo_enrich_df(enriched_df, ip_col="src_ip", inplace=False)
     elif "asn" not in enriched_df.columns:
         enriched_df["asn"] = "AS0"
+
+    # Ensure behavioural clustering & graph communities are present
+    if "behaviour_cluster" not in enriched_df.columns or "graph_community" not in enriched_df.columns:
+        try:
+            import clustering
+            enriched_df, _ = clustering.apply_clustering_to_transactions(enriched_df, features)
+        except Exception as _cl_err:
+            pass
+
     return enriched_df, features
 
 
@@ -833,10 +879,20 @@ max_risk = df["risk_score"].max() if total_flagged > 0 else 0.0
 
 # Count specific detections
 whitelisted_count = df["explanation"].str.contains("Regulated", na=False).sum()
-mixer_count = df["attack_type"].eq("CoinJoin_Mixer").sum() if "attack_type" in df.columns else 0
-peel_count = df["attack_type"].eq("Peel_Chain").sum() if "attack_type" in df.columns else 0
-fanout_count = df["attack_type"].eq("FanOut_Dispersal").sum() if "attack_type" in df.columns else 0
-feespike_count = df["attack_type"].eq("Fee_Spike").sum() if "attack_type" in df.columns else 0
+mixer_count = df["detected_type"].eq("CoinJoin_Mixer").sum() if "detected_type" in df.columns else 0
+peel_count = df["detected_type"].eq("Peel_Chain").sum() if "detected_type" in df.columns else 0
+fanout_count = df["detected_type"].eq("FanOut_Dispersal").sum() if "detected_type" in df.columns else 0
+feespike_count = df["detected_type"].eq("Fee_Spike").sum() if "detected_type" in df.columns else 0
+
+# Actionable-leads funnel
+cleared_count = int(((df["is_anomaly"] == True) & (df.get("whitelisted_side", pd.Series(dtype="object")).notna())).sum()) if "whitelisted_side" in df.columns else 0
+actionable_count = int(((df["is_anomaly"] == True) & (~df.get("whitelisted_side", pd.Series(dtype="object")).notna())).sum()) if "whitelisted_side" in df.columns else total_flagged
+
+# Risk tier counts
+tier_critical = int(df["risk_tier"].eq("Critical").sum()) if "risk_tier" in df.columns else 0
+tier_high = int(df["risk_tier"].eq("High").sum()) if "risk_tier" in df.columns else 0
+tier_medium = int(df["risk_tier"].eq("Medium").sum()) if "risk_tier" in df.columns else 0
+tier_low = int(df["risk_tier"].eq("Low").sum()) if "risk_tier" in df.columns else 0
 
 
 # ---------------------------------------------------------------------------
@@ -894,16 +950,70 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------------------
+# Ingestion Validation Report Expander
+# ---------------------------------------------------------------------------
+_ingest_report = getattr(adapter, "last_report", None) or {}
+with st.expander("🧾 Ingestion Report", expanded=False):
+    _r_read = _ingest_report.get("rows_read", len(df))
+    _r_valid = _ingest_report.get("rows_valid", len(df))
+    _r_rejected = _ingest_report.get("rows_rejected", 0)
+    _r_dups = _ingest_report.get("duplicate_txids", 0)
+    _r_range = _ingest_report.get("timestamp_range", [None, None])
+    _r_sha = _ingest_report.get("sha256") or file_hash
+    if not _r_sha or _r_sha == "N/A":
+        _r_sha = file_hash
+
+    # Small metrics
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    m_col1.metric("Rows Read", f"{_r_read:,}")
+    m_col2.metric("Valid Rows", f"{_r_valid:,}")
+    m_col3.metric("Rejected Rows", f"{_r_rejected:,}")
+    m_col4.metric("Duplicates", f"{_r_dups:,}")
+
+    # Time range and SHA-256
+    _ts_str = f"{_r_range[0]}  ➔  {_r_range[1]}" if _r_range and all(_r_range) else "N/A"
+    st.markdown(
+        f'<div style="background:{_hp["card"]}; border:1px solid {_hp["card_border"]}; border-radius:6px; padding:10px 14px; margin:10px 0; font-size:0.82rem;">'
+        f'<div><b>⏱️ Time Range:</b> <span style="font-family:monospace; color:{_hp["accent"]};">{_ts_str}</span></div>'
+        f'<div style="margin-top:4px;"><b>🔒 SHA-256 Provenance:</b> <code style="color:{_hp["text"]}; word-break:break-all;">{_r_sha}</code></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Reasons table
+    _reasons = _ingest_report.get("reject_reasons", {})
+    if _reasons and any(v > 0 for v in _reasons.values()):
+        reasons_list = [
+            {"Reason": k.replace("_", " ").title(), "Count": int(v)}
+            for k, v in _reasons.items() if v > 0
+        ]
+        st.dataframe(pd.DataFrame(reasons_list), use_container_width=True, hide_index=True)
+    else:
+        st.caption("✅ All rows passed schema and structural integrity checks (0 rejections).")
+
+    # Download report button
+    report_json = json.dumps(_ingest_report, indent=2, default=str)
+    st.download_button(
+        label="Download report (JSON)",
+        data=report_json,
+        file_name="ingestion_validation_report.json",
+        mime="application/json",
+        key="btn_download_ingestion_report",
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MULTI-TAB ARCHITECTURE
 # ═══════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Overview",
     "🚨 Suspicious Transactions",
     "🕸️ Network Graph",
     "🔍 Why Flagged?",
+    "📈 Model Performance",
+    "👥 Clusters & Communities",
 ])
 
 
@@ -939,7 +1049,7 @@ with tab1:
                 <div class="card-icon">🚨</div>
                 <div class="card-label">ML Anomalies Flagged</div>
                 <div class="card-value">{total_flagged}</div>
-                <div class="card-sub">{anomaly_pct:.1f}% anomaly detection rate</div>
+                <div class="card-sub">{total_flagged} flagged → {cleared_count} cleared by whitelist → {actionable_count} actionable</div>
             </div>
         </div>
         """,
@@ -968,6 +1078,19 @@ with tab1:
                 <div class="card-value">{max_risk:.1f}%</div>
                 <div class="card-sub">Highest anomaly deviation from baseline</div>
             </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Risk tier badges row ──
+    st.markdown(
+        f"""
+        <div style="display:flex; justify-content:center; gap:1rem; margin:0.6rem 0 0.2rem 0; flex-wrap:wrap;">
+            <span style="background:rgba(239,68,68,0.15); color:#ef4444; padding:0.3rem 0.9rem; border-radius:999px; font-size:0.78rem; font-weight:700; border:1px solid rgba(239,68,68,0.3);">🔴 Critical: {tier_critical}</span>
+            <span style="background:rgba(249,115,22,0.15); color:#f97316; padding:0.3rem 0.9rem; border-radius:999px; font-size:0.78rem; font-weight:700; border:1px solid rgba(249,115,22,0.3);">🟠 High: {tier_high}</span>
+            <span style="background:rgba(234,179,8,0.15); color:#eab308; padding:0.3rem 0.9rem; border-radius:999px; font-size:0.78rem; font-weight:700; border:1px solid rgba(234,179,8,0.3);">🟡 Medium: {tier_medium}</span>
+            <span style="background:rgba(107,114,128,0.15); color:#9ca3af; padding:0.3rem 0.9rem; border-radius:999px; font-size:0.78rem; font-weight:700; border:1px solid rgba(107,114,128,0.3);">⚪ Low: {tier_low}</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1004,13 +1127,13 @@ with tab1:
             '<div class="section-title"><span class="icon">📊</span> Threat Vector Distribution</div>',
             unsafe_allow_html=True,
         )
-        if "attack_type" in df.columns:
-            attack_counts = df["attack_type"].value_counts().reset_index()
-            attack_counts.columns = ["Attack Type", "Count"]
+        if "detected_type" in df.columns:
+            attack_counts = df["detected_type"].value_counts().reset_index()
+            attack_counts.columns = ["Detected Pattern", "Count"]
             chart1 = alt.Chart(attack_counts).mark_bar(
                 cornerRadiusTopLeft=6, cornerRadiusTopRight=6, color=_cp["accent2"]
             ).encode(
-                x=alt.X("Attack Type:N", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], labelAngle=-30)),
+                x=alt.X("Detected Pattern:N", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], labelAngle=-30)),
                 y=alt.Y("Count:Q", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], gridColor=_cp["chart_grid"])),
             ).properties(height=300).configure(background=_cp["chart_bg"]).configure_view(strokeWidth=0)
             st.altair_chart(chart1, use_container_width=True)
@@ -1020,21 +1143,34 @@ with tab1:
             '<div class="section-title"><span class="icon">📈</span> Risk Score Distribution</div>',
             unsafe_allow_html=True,
         )
-        if total_flagged > 0:
-            _bins = range(0, 101, 10)
-            _cut = pd.cut(flagged_df["risk_score"], bins=_bins, include_lowest=True, right=True)
-            risk_hist = _cut.value_counts().sort_index().reset_index()
-            risk_hist.columns = ["Risk Bin", "Count"]
-            risk_hist["Risk Bin"] = [f"{b.left:.0f}–{b.right:.0f}" for b in risk_hist["Risk Bin"]]
-            chart2 = alt.Chart(risk_hist).mark_bar(
-                cornerRadiusTopLeft=6, cornerRadiusTopRight=6, color="#ef4444"
+        if total_tx > 0:
+            _bins = list(range(0, 101, 10))
+            # Build per-group histograms
+            _hist_rows = []
+            for _, _r in df.iterrows():
+                _sc = _r["risk_score"]
+                _grp = "Whitelisted" if ("whitelisted_side" in df.columns and pd.notna(_r.get("whitelisted_side"))) else "Non-whitelisted"
+                _hist_rows.append({"score": _sc, "Group": _grp})
+            _hist_df = pd.DataFrame(_hist_rows)
+            _hist_df["Risk Bin"] = pd.cut(_hist_df["score"], bins=_bins, include_lowest=True, right=True)
+            _hist_df["Risk Bin"] = _hist_df["Risk Bin"].apply(lambda b: f"{b.left:.0f}–{b.right:.0f}" if pd.notna(b) else "100")
+            _hist_agg = _hist_df.groupby(["Risk Bin", "Group"], as_index=False).size()
+            _hist_agg.columns = ["Risk Bin", "Group", "Count"]
+            _color_scale = alt.Scale(
+                domain=["Non-whitelisted", "Whitelisted"],
+                range=["#ef4444", "#6b7280"],
+            )
+            chart2 = alt.Chart(_hist_agg).mark_bar(
+                cornerRadiusTopLeft=4, cornerRadiusTopRight=4,
             ).encode(
-                x=alt.X("Risk Bin:N", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], labelAngle=-30)),
-                y=alt.Y("Count:Q", axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], gridColor=_cp["chart_grid"])),
+                x=alt.X("Risk Bin:N", sort=_bins, axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], labelAngle=-30)),
+                y=alt.Y("Count:Q", stack=True, axis=alt.Axis(labelColor=_cp["chart_text"], titleColor=_cp["chart_text"], gridColor=_cp["chart_grid"])),
+                color=alt.Color("Group:N", scale=_color_scale, legend=alt.Legend(title="Group", labelColor=_cp["chart_text"], titleColor=_cp["chart_text"])),
+                order=alt.Order("Group:N", sort="descending"),
             ).properties(height=300).configure(background=_cp["chart_bg"]).configure_view(strokeWidth=0)
             st.altair_chart(chart2, use_container_width=True)
         else:
-            st.info("No anomalies to display.")
+            st.info("No data to display.")
 
     # ── Export buttons ──
     st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
@@ -1126,11 +1262,11 @@ with tab2:
         st.markdown("Each row is one transaction. Investigative Priority % is the AI risk score (higher = more suspicious). Cluster confidence shows how reliable the wallet grouping is: High-Confidence, Mixer-Affected, or Heuristic/Inferred. Use the filters to narrow by attack type or risk range.")
 
     # ── Filters ──
-    filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 1])
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 2, 1.5, 1])
 
     with filter_col1:
-        attack_types = ["All"] + sorted(df["attack_type"].unique().tolist()) if "attack_type" in df.columns else ["All"]
-        selected_type = st.selectbox("Filter by Attack Type", attack_types)
+        detected_types = ["All"] + sorted(df["detected_type"].unique().tolist()) if "detected_type" in df.columns else ["All"]
+        selected_type = st.selectbox("Filter by Detected Pattern", detected_types)
 
     with filter_col2:
         risk_range = st.slider(
@@ -1142,12 +1278,31 @@ with tab2:
         )
 
     with filter_col3:
+        _all_tiers = ["Critical", "High", "Medium", "Low"]
+        _available_tiers = sorted(df["risk_tier"].unique().tolist(), key=lambda t: _all_tiers.index(t) if t in _all_tiers else 99) if "risk_tier" in df.columns else _all_tiers
+        selected_tiers = st.multiselect("Risk Tier", _available_tiers, default=_available_tiers)
+
+    with filter_col4:
         anomalies_only = st.toggle("Anomalies Only", value=False)
+
+    filter_clust_col1, filter_clust_col2 = st.columns(2)
+    with filter_clust_col1:
+        _all_clusters = ["All"] + sorted(df["behaviour_cluster"].dropna().unique().tolist()) if "behaviour_cluster" in df.columns else ["All"]
+        selected_cluster = st.selectbox("Filter by Behaviour Cluster", _all_clusters)
+    with filter_clust_col2:
+        _all_comms = ["All"] + sorted(df["graph_community"].dropna().unique().tolist()) if "graph_community" in df.columns else ["All"]
+        selected_comm = st.selectbox("Filter by Graph Community", _all_comms)
 
     # ── Apply filters ──
     view_df = df.copy()
-    if selected_type != "All" and "attack_type" in view_df.columns:
-        view_df = view_df[view_df["attack_type"] == selected_type]
+    if selected_type != "All" and "detected_type" in view_df.columns:
+        view_df = view_df[view_df["detected_type"] == selected_type]
+    if "risk_tier" in view_df.columns and selected_tiers:
+        view_df = view_df[view_df["risk_tier"].isin(selected_tiers)]
+    if selected_cluster != "All" and "behaviour_cluster" in view_df.columns:
+        view_df = view_df[view_df["behaviour_cluster"] == selected_cluster]
+    if selected_comm != "All" and "graph_community" in view_df.columns:
+        view_df = view_df[view_df["graph_community"] == selected_comm]
     view_df = view_df[
         (view_df["risk_score"] >= risk_range[0]) &
         (view_df["risk_score"] <= risk_range[1])
@@ -1161,13 +1316,37 @@ with tab2:
     )
 
     # ── Build display table ──
+    # Prepare Watchlist, Taint %, and Hops from known-bad
+    view_df["Watchlist"] = view_df.apply(
+        lambda r: str(r.get("watchlist_label", "")) if r.get("watchlist_hit") and pd.notna(r.get("watchlist_label")) else "",
+        axis=1,
+    )
+    view_df["Taint %"] = view_df["taint_score"].apply(
+        lambda v: round(float(v), 1) if pd.notna(v) and str(v) != "nan" else 0.0
+    ) if "taint_score" in view_df.columns else 0.0
+
+    view_df["Hops from known-bad"] = view_df["taint_hops"].apply(
+        lambda v: str(int(v)) if pd.notna(v) and v is not None and str(v) not in ("nan", "None", "") else ""
+    ) if "taint_hops" in view_df.columns else ""
+
     display_cols = [
         "txid", "risk_score", "entity_id", "cluster_confidence", "explanation",
         "src_port", "dst_port", "total_amount_btc", "fee",
         "script_type", "geo_country", "asn",
     ]
-    if "attack_type" in view_df.columns:
-        display_cols.insert(3, "attack_type")
+    if "risk_tier" in view_df.columns:
+        display_cols.insert(2, "risk_tier")
+    if "detected_type" in view_df.columns:
+        display_cols.insert(3, "detected_type")
+
+    ins_idx = 4 if "detected_type" in view_df.columns else 3
+    display_cols.insert(ins_idx, "Watchlist")
+    display_cols.insert(ins_idx + 1, "Taint %")
+    display_cols.insert(ins_idx + 2, "Hops from known-bad")
+    if "behaviour_cluster" in view_df.columns:
+        display_cols.insert(ins_idx + 3, "behaviour_cluster")
+    if "graph_community" in view_df.columns:
+        display_cols.insert(ins_idx + 4, "graph_community")
 
     display_df = view_df[[c for c in display_cols if c in view_df.columns]].copy()
 
@@ -1188,8 +1367,11 @@ with tab2:
     rename_map = {
         "txid": "TX ID",
         "risk_score": "Investigative Priority %",
+        "risk_tier": "Risk Tier",
         "entity_id": "Entity",
-        "attack_type": "Attack Type",
+        "detected_type": "Detected Pattern",
+        "behaviour_cluster": "Behaviour Cluster",
+        "graph_community": "Graph Community",
         "explanation": "XAI Explanation",
         "src_port": "Src Port",
         "dst_port": "Dst Port",
@@ -1221,15 +1403,40 @@ with tab2:
 
     prio_col = "Investigative Priority %" if "Investigative Priority %" in display_df.columns else "Risk %"
     _tp = _get_palette()
-    styled_df = (
+    # Tier colour styling function
+    _tier_colors = {
+        "Critical": "rgba(239, 68, 68, 0.25)",
+        "High": "rgba(249, 115, 22, 0.25)",
+        "Medium": "rgba(234, 179, 8, 0.20)",
+        "Low": "rgba(107, 114, 128, 0.15)",
+    }
+    _tier_text_colors = {
+        "Critical": "#ef4444",
+        "High": "#f97316",
+        "Medium": "#eab308",
+        "Low": "#9ca3af",
+    }
+    def _style_risk_tier(val):
+        bg = _tier_colors.get(val, "")
+        fg = _tier_text_colors.get(val, _tp["df_text"])
+        return f"background-color: {bg}; color: {fg}; font-weight: 700" if bg else ""
+
+    _fmt = {"Amount (BTC)": "{:.6f}", prio_col: "{:.1f}", "Fee": "{:.8f}"}
+    if "Taint %" in display_df.columns:
+        _fmt["Taint %"] = "{:.1f}"
+
+    _styler = (
         display_df.style
         .background_gradient(subset=[prio_col], cmap="YlOrRd", vmin=0, vmax=100)
-        .format({"Amount (BTC)": "{:.6f}", prio_col: "{:.1f}", "Fee": "{:.8f}"})
+        .format(_fmt)
         .set_properties(**{"background-color": _tp["df_bg"], "color": _tp["df_text"]})
         .set_table_styles([
             {"selector": "th", "props": [("background-color", _tp["card"]), ("color", _tp["text"])]},
         ])
     )
+    if "Risk Tier" in display_df.columns:
+        _styler = _styler.map(_style_risk_tier, subset=["Risk Tier"])
+    styled_df = _styler
     st.dataframe(
         styled_df,
         use_container_width=True,
@@ -1266,7 +1473,8 @@ with tab3:
             <span style="color:#f59e0b; font-weight:600;">◆ Amber = transactions</span> &nbsp;·&nbsp;
             <span style="color:#9b59b6; font-weight:600;">■ Purple = wallet entities</span> &nbsp;·&nbsp;
             <span style="color:#4ade80; font-weight:600;">● Green = regulated</span> &nbsp;·&nbsp;
-            <span style="color:#3b82f6; font-weight:600;">● Blue = context nodes</span>
+            <span style="color:#3b82f6; font-weight:600;">● Blue = context nodes</span> &nbsp;·&nbsp;
+            <span style="color:#ef4444; font-weight:600;">★ = watchlist (known-bad)</span>
         </p>
         """,
         unsafe_allow_html=True,
@@ -1274,7 +1482,7 @@ with tab3:
     _tab_p = _get_palette()
     st.markdown(f'<p style="color:{_tab_p["muted"]};font-size:0.88rem;margin-bottom:0.2rem;">See which wallets, IPs, and transactions are connected.</p>', unsafe_allow_html=True)
     with st.expander("ℹ️ How to read this"):
-        st.markdown("Nodes are wallets, IP addresses and transactions; lines show how funds and observations connect. Red = flagged anomalies, amber = transactions, purple = wallet entities, green = regulated/whitelisted, blue = context nodes. Pick a target entity to isolate its neighbourhood. Drag, zoom and hover to explore.")
+        st.markdown("Nodes are wallets, IP addresses and transactions; lines show how funds and observations connect. Red = flagged anomalies, amber = transactions, purple = wallet entities, green = regulated/whitelisted, blue = context nodes, ★ star = watchlist (known-bad). Pick a target entity to isolate its neighbourhood. Drag, zoom and hover to explore.")
 
     # ── Graph mode toggle ──
     toggle_col1, toggle_col2 = st.columns([1, 3])
@@ -1360,7 +1568,24 @@ with tab3:
         }
         """)
 
+        # Load known-bad watchlist
+        try:
+            from ml_engine import load_watchlist
+            _wl_dict = load_watchlist()
+            _wl_addrs = {e["indicator"].lower(): e for e in _wl_dict.get("address", [])}
+            _wl_ips = {e["indicator"].lower(): e for e in _wl_dict.get("ip", [])}
+        except Exception:
+            _wl_addrs = {}
+            _wl_ips = {}
+
+        _wl_hit_entities = set()
+        for _, r in graph_df.iterrows():
+            if r.get("watchlist_hit"):
+                if "entity_id" in r and pd.notna(r["entity_id"]):
+                    _wl_hit_entities.add(str(r["entity_id"]))
+
         anom_rows = graph_df[graph_df["is_anomaly"] == True]
+        wl_rows = graph_df[graph_df["watchlist_hit"] == True] if "watchlist_hit" in graph_df.columns else pd.DataFrame()
         regulated_rows = graph_df[graph_df["explanation"].str.contains("Regulated", na=False)]
 
         anom_ips = set(anom_rows["src_ip"].unique())
@@ -1382,9 +1607,9 @@ with tab3:
             already_selected = set(context_rows.index)
             clean_pool = normal_rows[~normal_rows.index.isin(already_selected)]
             clean_sample = clean_pool.sample(n=min(MAX_CLEAN_SAMPLE, len(clean_pool)), random_state=42)
-            plot_df = pd.concat([anom_rows, regulated_rows.head(10), context_rows, clean_sample]).drop_duplicates()
+            plot_df = pd.concat([anom_rows, wl_rows, regulated_rows.head(10), context_rows, clean_sample]).drop_duplicates()
         else:
-            plot_df = pd.concat([anom_rows, context_rows]).drop_duplicates()
+            plot_df = pd.concat([anom_rows, wl_rows, context_rows]).drop_duplicates()
 
         import networkx as nx
         temp_nx = nx.DiGraph()
@@ -1402,16 +1627,28 @@ with tab3:
 
             # ─── IP node ───
             if src_ip not in added_nodes:
-                if is_anom or src_ip in anom_ips:
-                    ip_color, ip_size = "#ef4444", 24
-                    ip_title = f"⚠️ SUSPICIOUS IP: {src_ip}"
-                elif is_regulated:
-                    ip_color, ip_size = "#4ade80", 18
-                    ip_title = f"✅ REGULATED IP: {src_ip}"
+                if src_ip.lower() in _wl_ips:
+                    ip_color = {"background": "black", "border": "#ef4444"}
+                    ip_size = 28
+                    ip_shape = "star"
+                    ip_lbl = _wl_ips[src_ip.lower()].get("label", "Threat Indicator")
+                    ip_title = f"★ WATCHLIST IP ({ip_lbl}): {src_ip}"
+                    temp_nx.add_node(
+                        src_ip, label=f"★ {src_ip}", color=ip_color, size=ip_size,
+                        shape=ip_shape, borderWidth=3, title=ip_title,
+                        font={"size": 12, "color": "#ef4444", "bold": True},
+                    )
                 else:
-                    ip_color, ip_size = "#3b82f6", 14
-                    ip_title = f"IP: {src_ip}"
-                temp_nx.add_node(src_ip, label=src_ip, color=ip_color, size=ip_size, shape="dot", title=ip_title)
+                    if is_anom or src_ip in anom_ips:
+                        ip_color, ip_size = "#ef4444", 24
+                        ip_title = f"⚠️ SUSPICIOUS IP: {src_ip}"
+                    elif is_regulated:
+                        ip_color, ip_size = "#4ade80", 18
+                        ip_title = f"✅ REGULATED IP: {src_ip}"
+                    else:
+                        ip_color, ip_size = "#3b82f6", 14
+                        ip_title = f"IP: {src_ip}"
+                    temp_nx.add_node(src_ip, label=src_ip, color=ip_color, size=ip_size, shape="dot", title=ip_title)
                 added_nodes.add(src_ip)
 
             # ─── TX node ───
@@ -1431,43 +1668,57 @@ with tab3:
 
             # ─── Entity node ───
             if entity not in added_nodes:
-                # Phase 3: cluster confidence labels (not all common-inputs are
-                # absolute facts — label based on evidence strength)
-                is_mixer_ent = "CoinJoin" in str(row.get("attack_type", ""))
-                if is_regulated:
-                    ent_color, ent_size = "#10b981", 28  # Emerald Green
-                    ent_title = f"✅ REGULATED ENTITY: {entity}"
-                    cluster_label = "Whitelisted cluster"
-                    display_label = f"{entity} 🛡️"
-                elif is_mixer_ent:
-                    ent_color, ent_size = "#a78bfa", 26
-                    ent_title = (
-                        f"⚠️ MIXER-AFFECTED ENTITY: {entity}\n"
-                        f"Cluster Confidence: LOWER (CoinJoin may merge unrelated wallets)"
+                is_wl_ent = (entity.lower() in _wl_addrs) or (entity in _wl_hit_entities)
+                if is_wl_ent:
+                    ent_color = {"background": "black", "border": "#ef4444"}
+                    ent_size = 32
+                    ent_shape = "star"
+                    ent_lbl = _wl_addrs.get(entity.lower(), {}).get("label", "Known-Bad Wallet")
+                    ent_title = f"★ WATCHLIST ENTITY ({ent_lbl}): {entity}"
+                    display_label = f"★ {entity}"
+                    temp_nx.add_node(
+                        entity, label=display_label, color=ent_color, size=ent_size, shape=ent_shape,
+                        title=ent_title, borderWidth=3,
+                        font={"size": 14, "color": "#ffffff", "bold": True},
                     )
-                    cluster_label = "Mixer-affected cluster"
-                    display_label = entity
-                elif is_anom or entity in anom_entities:
-                    ent_color, ent_size = "#dc2626", 30  # Crimson
-                    ent_title = (
-                        f"⚠️ HIGH-RISK ENTITY: {entity}\n"
-                        f"Cluster Confidence: HIGH (multi-hop peel chain linkage)"
-                    )
-                    cluster_label = "High-confidence cluster"
-                    display_label = entity
                 else:
-                    ent_color, ent_size = "#9b59b6", 22
-                    ent_title = (
-                        f"Entity Cluster: {entity}\n"
-                        f"Cluster Confidence: HEURISTIC (common-input-ownership)"
+                    # Phase 3: cluster confidence labels (not all common-inputs are
+                    # absolute facts — label based on evidence strength)
+                    is_mixer_ent = "CoinJoin" in str(row.get("detected_type", ""))
+                    if is_regulated:
+                        ent_color, ent_size = "#10b981", 28  # Emerald Green
+                        ent_title = f"✅ REGULATED ENTITY: {entity}"
+                        cluster_label = "Whitelisted cluster"
+                        display_label = f"{entity} 🛡️"
+                    elif is_mixer_ent:
+                        ent_color, ent_size = "#a78bfa", 26
+                        ent_title = (
+                            f"⚠️ MIXER-AFFECTED ENTITY: {entity}\n"
+                            f"Cluster Confidence: LOWER (CoinJoin may merge unrelated wallets)"
+                        )
+                        cluster_label = "Mixer-affected cluster"
+                        display_label = entity
+                    elif is_anom or entity in anom_entities:
+                        ent_color, ent_size = "#dc2626", 30  # Crimson
+                        ent_title = (
+                            f"⚠️ HIGH-RISK ENTITY: {entity}\n"
+                            f"Cluster Confidence: HIGH (multi-hop peel chain linkage)"
+                        )
+                        cluster_label = "High-confidence cluster"
+                        display_label = entity
+                    else:
+                        ent_color, ent_size = "#9b59b6", 22
+                        ent_title = (
+                            f"Entity Cluster: {entity}\n"
+                            f"Cluster Confidence: HEURISTIC (common-input-ownership)"
+                        )
+                        cluster_label = "Heuristic cluster"
+                        display_label = entity
+                    temp_nx.add_node(
+                        entity, label=display_label, color=ent_color, size=ent_size, shape="square",
+                        title=ent_title, borderWidth=3,
+                        font={"size": 14, "color": "#ffffff", "bold": True},
                     )
-                    cluster_label = "Heuristic cluster"
-                    display_label = entity
-                temp_nx.add_node(
-                    entity, label=display_label, color=ent_color, size=ent_size, shape="square",
-                    title=ent_title, borderWidth=3,
-                    font={"size": 14, "color": "#ffffff", "bold": True},
-                )
                 added_nodes.add(entity)
 
             # ─── Edges ───
@@ -1538,7 +1789,7 @@ with tab4:
     # ── Transaction selector ──
     sorted_df = df.sort_values("risk_score", ascending=False)
     tx_options = [
-        f"{row['txid'][:12]}... | Anomaly Score: {row['risk_score']:.1f}% | {row.get('attack_type', 'N/A')}"
+        f"{row['txid'][:12]}... | Anomaly Score: {row['risk_score']:.1f}% | {row.get('detected_type', 'N/A')}"
         for _, row in sorted_df.iterrows()
     ]
     txid_map = {opt: row["txid"] for opt, (_, row) in zip(tx_options, sorted_df.iterrows())}
@@ -1557,16 +1808,17 @@ with tab4:
 
         # ── Transaction detail card ──
         risk_val = tx_row["risk_score"]
-        if risk_val >= 80:
-            risk_badge = '<span class="badge badge-red">CRITICAL</span>'
-        elif risk_val >= 50:
-            risk_badge = '<span class="badge badge-amber">HIGH</span>'
-        elif risk_val > 0:
-            risk_badge = '<span class="badge badge-blue">NORMAL</span>'
-        else:
-            risk_badge = '<span class="badge badge-green">CLEAR</span>'
+        _row_tier = tx_row.get("risk_tier", "Low") if "risk_tier" in df.columns else ("Critical" if risk_val >= 80 else "High" if risk_val >= 60 else "Medium" if risk_val >= 40 else "Low")
+        _tier_badge_map = {
+            "Critical": ("badge-red", "CRITICAL"),
+            "High": ("badge-amber", "HIGH"),
+            "Medium": ("badge-blue", "MEDIUM"),
+            "Low": ("badge-green", "LOW"),
+        }
+        _tb_cls, _tb_label = _tier_badge_map.get(_row_tier, ("badge-blue", "LOW"))
+        risk_badge = f'<span class="badge {_tb_cls}">{_tb_label}</span>'
 
-        attack_type = tx_row.get("attack_type", "Unknown")
+        detected_type = tx_row.get("detected_type", "Unknown")
         attack_badge_map = {
             "CoinJoin_Mixer": "badge-purple",
             "Peel_Chain": "badge-amber",
@@ -1575,7 +1827,7 @@ with tab4:
             "Normal_P2P": "badge-blue",
             "Whitelisted_Institutional": "badge-green",
         }
-        attack_badge_cls = attack_badge_map.get(attack_type, "badge-blue")
+        attack_badge_cls = attack_badge_map.get(detected_type, "badge-blue")
 
         _dp = _get_palette()
         st.markdown(
@@ -1590,7 +1842,7 @@ with tab4:
                     </div>
                     <div style="display: flex; gap: 0.5rem; align-items: center;">
                         {risk_badge}
-                        <span class="badge {attack_badge_cls}">{attack_type}</span>
+                        <span class="badge {attack_badge_cls}">{detected_type}</span>
                         <span style="color: {_dp['muted']}; font-size: 0.72rem; margin-right: 4px;">Anomaly Score:</span>
                         <span style="color: {_dp['text']}; font-size: 1.4rem; font-weight: 800;">{risk_val:.1f}%</span>
                     </div>
@@ -1646,6 +1898,117 @@ with tab4:
             unsafe_allow_html=True,
         )
 
+        # ── 🧮 Score Breakdown ──
+        st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-title"><span class="icon">🧮</span> Score Breakdown</div>',
+            unsafe_allow_html=True,
+        )
+
+        _sb_ml  = float(tx_row.get("score_ml", risk_val))
+        _sb_pat = float(tx_row.get("score_pattern", 0))
+        _sb_net = float(tx_row.get("score_network", 0))
+        _sb_gra = float(tx_row.get("score_graph", 0))
+        _sb_wlf = float(tx_row.get("whitelist_factor", 1.0))
+        _sb_final = float(tx_row.get("risk_score", risk_val))
+
+        from anomaly_engine import WEIGHTS as _W
+        _contrib_ml  = round(_W["ml"]      * _sb_ml,  1)
+        _contrib_pat = round(_W["pattern"] * _sb_pat, 1)
+        _contrib_net = round(_W["network"] * _sb_net, 1)
+        _contrib_gra = round(_W["graph"]   * _sb_gra, 1)
+        _raw_total = _contrib_ml + _contrib_pat + _contrib_net + _contrib_gra
+        _wl_discount = round(_sb_final - _raw_total, 1) if _sb_wlf < 1.0 else 0.0
+
+        _breakdown_rows = [
+            {"Component": f"ML anomaly ({_W['ml']:.0%})", "Value": _contrib_ml, "Color": "component"},
+            {"Component": f"Pattern detectors ({_W['pattern']:.0%})", "Value": _contrib_pat, "Color": "component"},
+            {"Component": f"Network risk ({_W['network']:.0%})", "Value": _contrib_net, "Color": "component"},
+            {"Component": f"Graph / taint ({_W['graph']:.0%})", "Value": _contrib_gra, "Color": "component"},
+        ]
+        if _sb_wlf < 1.0:
+            _breakdown_rows.append(
+                {"Component": "Whitelist discount", "Value": _wl_discount, "Color": "discount"}
+            )
+        _breakdown_rows.append(
+            {"Component": "Final priority", "Value": _sb_final, "Color": "final"}
+        )
+        _bd_df = pd.DataFrame(_breakdown_rows)
+        _bd_order = [r["Component"] for r in _breakdown_rows]
+
+        _bd_color_scale = alt.Scale(
+            domain=["component", "discount", "final"],
+            range=[_dp["accent2"], "#6b7280", "#ef4444"],
+        )
+        _bd_chart = alt.Chart(_bd_df).mark_bar(cornerRadiusEnd=4).encode(
+            y=alt.Y("Component:N", sort=_bd_order, axis=alt.Axis(labelColor=_dp["text"], titleColor=_dp["text"])),
+            x=alt.X("Value:Q", axis=alt.Axis(labelColor=_dp["text"], titleColor=_dp["text"], gridColor=_dp.get("chart_grid", "rgba(255,255,255,0.06)"))),
+            color=alt.Color("Color:N", scale=_bd_color_scale, legend=None),
+        ).properties(height=max(len(_breakdown_rows) * 36, 180))
+
+        # Add labels
+        _bd_text = alt.Chart(_bd_df).mark_text(
+            align="left", dx=4, fontSize=11, color=_dp["text"],
+        ).encode(
+            y=alt.Y("Component:N", sort=_bd_order),
+            x=alt.X("Value:Q"),
+            text=alt.Text("Value:Q", format=".1f"),
+        )
+
+        st.altair_chart(
+            (_bd_chart + _bd_text).configure(
+                background=_dp.get("chart_bg", "transparent")
+            ).configure_view(strokeWidth=0),
+            use_container_width=True,
+        )
+
+        # ── Top Feature Deviations chart ──
+        telemetry_str_bd = tx_row.get("telemetry", "")
+        if isinstance(telemetry_str_bd, str) and telemetry_str_bd.strip():
+            try:
+                _telem_data = json.loads(telemetry_str_bd)
+                if _telem_data:
+                    _dev_rows = []
+                    for _t in _telem_data[:6]:
+                        _fname = _t.get("label", _t.get("feature_name", ""))
+                        _pctile = float(_t.get("percentile_rank", 50))
+                        _dev_rows.append({"Feature": _fname, "Deviation": round(_pctile - 50, 1)})
+                    if _dev_rows:
+                        _dev_df = pd.DataFrame(_dev_rows)
+                        _dev_order = [r["Feature"] for r in _dev_rows]
+                        _dev_chart = alt.Chart(_dev_df).mark_bar(cornerRadiusEnd=3).encode(
+                            y=alt.Y("Feature:N", sort=_dev_order, axis=alt.Axis(labelColor=_dp["text"], titleColor=_dp["text"])),
+                            x=alt.X("Deviation:Q", axis=alt.Axis(labelColor=_dp["text"], titleColor=_dp["text"], gridColor=_dp.get("chart_grid", "rgba(255,255,255,0.06)"))),
+                            color=alt.condition(
+                                alt.datum.Deviation > 0,
+                                alt.value("#ef4444"),
+                                alt.value("#22c55e"),
+                            ),
+                        ).properties(height=max(len(_dev_rows) * 34, 150), title=alt.TitleParams(
+                            text="Top feature deviations (percentile − 50)",
+                            color=_dp["text"], fontSize=13,
+                        ))
+
+                        _dev_text = alt.Chart(_dev_df).mark_text(
+                            fontSize=10, color=_dp["text"],
+                        ).encode(
+                            y=alt.Y("Feature:N", sort=_dev_order),
+                            x=alt.X("Deviation:Q"),
+                            text=alt.Text("Deviation:Q", format=".1f"),
+                        ).transform_calculate(
+                            align="datum.Deviation >= 0 ? 'left' : 'right'",
+                            dx="datum.Deviation >= 0 ? 4 : -4",
+                        )
+
+                        st.altair_chart(
+                            (_dev_chart + _dev_text).configure(
+                                background=_dp.get("chart_bg", "transparent")
+                            ).configure_view(strokeWidth=0),
+                            use_container_width=True,
+                        )
+            except Exception:
+                pass  # Fall through to telemetry table
+
         # ── Telemetry Table ──
         telemetry_str = tx_row.get("telemetry", "")
         if isinstance(telemetry_str, str) and telemetry_str.strip():
@@ -1678,6 +2041,217 @@ with tab4:
                 st.error("Error parsing telemetry data.")
         else:
             st.info("No structured telemetry data available for this transaction.")
+
+        # ── 🧭 Follow the Money ──
+        st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-title"><span class="icon">🧭</span> Follow the Money</div>',
+            unsafe_allow_html=True,
+        )
+
+        import flow_tracer
+
+        _ftm_col1, _ftm_col2 = st.columns([1, 1])
+        with _ftm_col1:
+            trace_direction = st.radio(
+                "Trace Direction",
+                ["Forward", "Backward"],
+                horizontal=True,
+                key=f"ftm_dir_{selected_txid}",
+            )
+        with _ftm_col2:
+            trace_hops = st.slider(
+                "Hops",
+                min_value=1,
+                max_value=6,
+                value=4,
+                key=f"ftm_hops_{selected_txid}",
+            )
+
+        if trace_direction == "Forward":
+            hops_data = flow_tracer.trace_forward(df, selected_txid, max_hops=trace_hops)
+        else:
+            hops_data = flow_tracer.trace_backward(df, selected_txid, max_hops=trace_hops)
+
+        if not hops_data:
+            st.info("No transaction hops found for this identifier.")
+        else:
+            # ── Next Step Box ──
+            last_hop = hops_data[-1]
+            last_role = last_hop.get("role")
+            if last_role == "Exchange endpoint":
+                _ent = last_hop.get("whitelisted_entity") or "regulated exchange"
+                st.success(f"Funds reached {_ent}. Next step: lawful KYC request to this VASP.")
+            elif last_role == "Mixer":
+                st.warning("Trail enters a mixer; further tracing has low confidence.")
+
+            # ── Altair Timeline ──
+            # x = timestamp, y = BTC moving at each hop, points coloured by role, tooltip with txid, delta_t and retained_pct
+            _tl_rows = []
+            for h in hops_data:
+                _tl_rows.append({
+                    "Hop": h["hop"],
+                    "txid": h["txid"],
+                    "timestamp": pd.to_datetime(h["timestamp"]) if pd.notna(h.get("timestamp")) else pd.Timestamp.now(),
+                    "btc_in": h["btc_in"],
+                    "role": h["role"],
+                    "delta_t": h["delta_t_minutes"],
+                    "retained_pct": h["retained_pct"],
+                })
+            _tl_df = pd.DataFrame(_tl_rows)
+
+            _role_domain = [
+                "Source",
+                "Layering (peel)",
+                "Mixer",
+                "Exchange endpoint",
+                "Dispersal",
+                "Consolidation",
+                "Intermediary",
+            ]
+            _role_range = [
+                "#3B82F6",
+                "#F59E0B",
+                "#EF4444",
+                "#10B981",
+                "#8B5CF6",
+                "#EC4899",
+                "#64748B",
+            ]
+
+            _tl_points = alt.Chart(_tl_df).mark_circle(size=140).encode(
+                x=alt.X("timestamp:T", title="Timeline (Timestamp)"),
+                y=alt.Y("btc_in:Q", title="BTC Moving at Hop"),
+                color=alt.Color(
+                    "role:N",
+                    scale=alt.Scale(domain=_role_domain, range=_role_range),
+                    legend=alt.Legend(title="Role", orient="top"),
+                ),
+                tooltip=[
+                    alt.Tooltip("txid:N", title="TxID"),
+                    alt.Tooltip("role:N", title="Role"),
+                    alt.Tooltip("delta_t:Q", title="delta_t (min)", format=".1f"),
+                    alt.Tooltip("retained_pct:Q", title="retained (%)", format=".2f"),
+                    alt.Tooltip("btc_in:Q", title="BTC Moving", format=".4f"),
+                ],
+            )
+            _tl_line = alt.Chart(_tl_df).mark_line(
+                strokeDash=[3, 3], color="#94A3B8", strokeWidth=1.5
+            ).encode(
+                x="timestamp:T",
+                y="btc_in:Q",
+            )
+            _timeline_chart = (_tl_line + _tl_points).properties(
+                height=260,
+                title=alt.TitleParams(
+                    text=f"Fund Flow Timeline ({trace_direction} Trace, {len(hops_data)} Hops)",
+                    color=_dp["text"],
+                    fontSize=12,
+                ),
+            )
+            st.altair_chart(
+                _timeline_chart.configure(
+                    background=_dp.get("chart_bg", "transparent")
+                ).configure_view(strokeWidth=0),
+                use_container_width=True,
+            )
+
+            # ── Hop Table ──
+            _hop_table_rows = [
+                {
+                    "Hop": h["hop"],
+                    "Role": h["role"],
+                    "TxID": f"{h['txid'][:14]}...",
+                    "Timestamp": str(h["timestamp"]),
+                    "Δt (min)": h["delta_t_minutes"],
+                    "BTC In": f"{h['btc_in']:.4f}",
+                    "Largest Output (BTC)": f"{h['largest_output_btc']:.4f}",
+                    "Retained %": f"{h['retained_pct']:.2f}%",
+                    "Peeled (BTC)": f"{h['peeled_btc']:.4f}",
+                }
+                for h in hops_data
+            ]
+            st.dataframe(pd.DataFrame(_hop_table_rows), use_container_width=True, hide_index=True)
+
+            # ── Small PyVis Graph of Only the Path ──
+            # with the selected tx in red and the endpoint in green
+            try:
+                path_net = Network(
+                    height="280px",
+                    width="100%",
+                    bgcolor=_dp.get("chart_bg", "#0f172a"),
+                    font_color=_dp["text"],
+                    directed=True,
+                )
+
+                for i, h in enumerate(hops_data):
+                    is_start = (i == 0)
+                    is_end = (i == len(hops_data) - 1 and len(hops_data) > 1)
+
+                    if is_start:
+                        n_color = "#ef4444"  # Red for selected tx
+                    elif is_end:
+                        n_color = "#22c55e"  # Green for endpoint
+                    else:
+                        n_color = "#3b82f6"  # Blue for intermediate
+
+                    lbl = f"Hop {h['hop']}: {h['role']}\n{h['txid'][:8]}...\n{h['btc_in']:.2f} BTC"
+                    title_tip = (
+                        f"TxID: {h['txid']}\n"
+                        f"Role: {h['role']}\n"
+                        f"BTC In: {h['btc_in']:.4f}\n"
+                        f"Retained: {h['retained_pct']:.2f}%\n"
+                        f"Peeled: {h['peeled_btc']:.4f} BTC\n"
+                        f"Δt: {h['delta_t_minutes']:.1f} min\n"
+                        f"Time: {h['timestamp']}"
+                    )
+                    path_net.add_node(
+                        h["txid"],
+                        label=lbl,
+                        title=title_tip,
+                        color=n_color,
+                        shape="box",
+                        font={"size": 11, "color": "#ffffff"},
+                    )
+
+                for i in range(len(hops_data) - 1):
+                    src_h = hops_data[i]
+                    dst_h = hops_data[i + 1]
+                    if trace_direction == "Forward":
+                        edge_src = src_h["txid"]
+                        edge_dst = dst_h["txid"]
+                    else:
+                        edge_src = dst_h["txid"]
+                        edge_dst = src_h["txid"]
+
+                    edge_lbl = f"{dst_h['btc_in']:.2f} BTC ({dst_h['delta_t_minutes']:.0f}m)"
+                    path_net.add_edge(
+                        edge_src,
+                        edge_dst,
+                        label=edge_lbl,
+                        color={"color": "#94a3b8", "highlight": "#38bdf8"},
+                        arrows="to",
+                        font={"size": 10, "color": _dp["muted"]},
+                    )
+
+                path_net.set_options("""
+                {
+                  "physics": {
+                    "hierarchicalRepulsion": { "nodeDistance": 130 },
+                    "solver": "hierarchicalRepulsion"
+                  },
+                  "layout": {
+                    "hierarchical": { "enabled": true, "direction": "LR", "sortMethod": "directed" }
+                  }
+                }
+                """)
+                _path_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w")
+                path_net.save_graph(_path_tmp.name)
+                with open(_path_tmp.name, "r") as _pf:
+                    _path_html = _pf.read()
+                components.html(_path_html, height=290, scrolling=False)
+            except Exception as _p_err:
+                st.caption(f"Path visualizer note: {_p_err}")
 
         # ── Address Flow Detail ──
         st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
@@ -1726,6 +2300,359 @@ with tab4:
             </div>
             """,
             unsafe_allow_html=True,
+        )
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 5: MODEL PERFORMANCE
+# ═══════════════════════════════════════════════════════════════════════════
+
+with tab5:
+    _p5 = _get_palette()
+    st.markdown(
+        f'<p style="color:{_p5["muted"]};font-size:0.88rem;margin-bottom:0.6rem;">'
+        "Supervised Calibrated Random Forest evaluation and benchmark against baseline detectors."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    # Check if dataset has labels (synthetic data)
+    if "attack_type" not in df.columns:
+        _sha256 = ""
+        _sha_path = "models/rf_model.sha256"
+        if os.path.isfile(_sha_path):
+            try:
+                with open(_sha_path, "r") as _sf:
+                    _sha256 = _sf.read().strip()
+            except Exception:
+                _sha256 = "unknown"
+        elif os.path.isfile("models/rf_model.joblib"):
+            try:
+                import hashlib
+                with open("models/rf_model.joblib", "rb") as _jf:
+                    _sha256 = hashlib.sha256(_jf.read()).hexdigest()
+            except Exception:
+                _sha256 = "unknown"
+        else:
+            _sha256 = "unknown"
+
+        st.info(f"Upload labelled data to evaluate. Using the pre-trained model {_sha256[:12]}.")
+    else:
+        st.caption(
+            "Measured on held-out synthetic data from MITHYA's own generator. "
+            "Real-world performance will be lower and must be validated on labelled case data."
+        )
+
+        import model_eval
+
+        # Cache evaluation in session_state so tab switching is instant
+        _eval_key = f"perf_eval_{len(df)}_{file_hash}"
+        if _eval_key not in st.session_state:
+            with st.spinner("🧠 Evaluating model performance and calibration..."):
+                st.session_state[_eval_key] = model_eval.run_evaluation_and_training(
+                    df, features_df, save_model=True, run_gen_test=True
+                )
+
+        _eval_res = st.session_state[_eval_key]
+        if _eval_res is not None:
+            _ho = _eval_res["holdout"]
+            _rf = _ho["rf"]
+
+            # ── 1. Metric cards: ROC-AUC, PR-AUC, Precision@25, F1, ECE ──
+            st.markdown(
+                f"""
+                <div class="bento-grid" style="grid-template-columns: repeat(5, 1fr); margin-bottom: 1.2rem;">
+                    <div class="bento-card card-blue">
+                        <div class="card-icon">🎯</div>
+                        <div class="card-label">ROC-AUC</div>
+                        <div class="card-value">{_rf['roc_auc']:.4f}</div>
+                        <div class="card-sub">Discrimination curve</div>
+                    </div>
+                    <div class="bento-card card-purple">
+                        <div class="card-icon">⚖️</div>
+                        <div class="card-label">PR-AUC</div>
+                        <div class="card-value">{_rf['pr_auc']:.4f}</div>
+                        <div class="card-sub">Precision-Recall trade-off</div>
+                    </div>
+                    <div class="bento-card card-red">
+                        <div class="card-icon">🔝</div>
+                        <div class="card-label">Precision@25</div>
+                        <div class="card-value">{_rf['precision_at_25']:.4f}</div>
+                        <div class="card-sub">Top-25 ranked accuracy</div>
+                    </div>
+                    <div class="bento-card card-orange">
+                        <div class="card-icon">🏆</div>
+                        <div class="card-label">F1-Score</div>
+                        <div class="card-value">{_rf['f1']:.4f}</div>
+                        <div class="card-sub">Harmonic mean P & R</div>
+                    </div>
+                    <div class="bento-card card-green">
+                        <div class="card-icon">📉</div>
+                        <div class="card-label">ECE (10 Bins)</div>
+                        <div class="card-value">{_ho['ece_after']:.4f}</div>
+                        <div class="card-sub">Before: {_ho['ece_before']:.4f}</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # ── 2. Hold-out Benchmark Table (4 Methods) ──
+            st.markdown(f'<h4 style="color:{_p5["accent"]};margin-top:1rem;margin-bottom:0.4rem;">Hold-Out Evaluation (70/30 Stratified Split)</h4>', unsafe_allow_html=True)
+            st.dataframe(_ho["table"], use_container_width=True, hide_index=True)
+
+            # ── 3. Altair ROC curve and PR curve with the 4 methods as coloured lines ──
+            _roc_pr_col1, _roc_pr_col2 = st.columns(2)
+
+            _all_methods = [_ho["rf"], _ho["isolation_forest"], _ho["rules"], _ho["fused"]]
+
+            # Build ROC DataFrame
+            _roc_rows = []
+            for _m in _all_methods:
+                for _fpr, _tpr in zip(_m["fpr_curve"], _m["tpr_curve"]):
+                    _roc_rows.append({"FPR": _fpr, "TPR": _tpr, "Method": _m["method"]})
+            _roc_df = pd.DataFrame(_roc_rows)
+
+            _diag_df = pd.DataFrame({"x": [0.0, 1.0], "y": [0.0, 1.0]})
+            _diag_chart = alt.Chart(_diag_df).mark_line(
+                strokeDash=[4, 4], color="#94A3B8"
+            ).encode(x="x:Q", y="y:Q")
+
+            _color_domain = ["Supervised RF (Calibrated)", "Isolation Forest only", "Rules only", "Fused Score"]
+            _color_range = ["#2DD4BF", "#F59E0B", "#8B5CF6", "#3B82F6"]
+
+            with _roc_pr_col1:
+                st.markdown(f'<p style="font-weight:600;font-size:0.95rem;color:{_p5["text"]};">Receiver Operating Characteristic (ROC)</p>', unsafe_allow_html=True)
+                _roc_line = alt.Chart(_roc_df).mark_line(strokeWidth=2.2).encode(
+                    x=alt.X("FPR:Q", title="False Positive Rate (FPR)", scale=alt.Scale(domain=[0, 1])),
+                    y=alt.Y("TPR:Q", title="True Positive Rate (TPR / Recall)", scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("Method:N", scale=alt.Scale(domain=_color_domain, range=_color_range), legend=alt.Legend(orient="bottom", title=None)),
+                    tooltip=["Method:N", alt.Tooltip("FPR:Q", format=".3f"), alt.Tooltip("TPR:Q", format=".3f")],
+                )
+                _roc_chart = (_roc_line + _diag_chart).properties(height=300)
+                st.altair_chart(_roc_chart, use_container_width=True)
+
+            # Build PR DataFrame
+            _pr_rows = []
+            for _m in _all_methods:
+                for _rec, _prec in zip(_m["pr_recall_curve"], _m["pr_precision_curve"]):
+                    _pr_rows.append({"Recall": _rec, "Precision": _prec, "Method": _m["method"]})
+            _pr_df = pd.DataFrame(_pr_rows)
+
+            with _roc_pr_col2:
+                st.markdown(f'<p style="font-weight:600;font-size:0.95rem;color:{_p5["text"]};">Precision-Recall Curves</p>', unsafe_allow_html=True)
+                _pr_line = alt.Chart(_pr_df).mark_line(strokeWidth=2.2).encode(
+                    x=alt.X("Recall:Q", title="Recall", scale=alt.Scale(domain=[0, 1])),
+                    y=alt.Y("Precision:Q", title="Precision", scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("Method:N", scale=alt.Scale(domain=_color_domain, range=_color_range), legend=alt.Legend(orient="bottom", title=None)),
+                    tooltip=["Method:N", alt.Tooltip("Recall:Q", format=".3f"), alt.Tooltip("Precision:Q", format=".3f")],
+                )
+                st.altair_chart(_pr_line.properties(height=300), use_container_width=True)
+
+            # ── 4. Confusion matrix heatmap and Calibration plot ──
+            _cm_cal_col1, _cm_cal_col2 = st.columns(2)
+
+            with _cm_cal_col1:
+                st.markdown(f'<p style="font-weight:600;font-size:0.95rem;color:{_p5["text"]};">Confusion Matrix (Calibrated RF)</p>', unsafe_allow_html=True)
+                _cm = _ho["confusion_matrix"]
+                _cm_data = pd.DataFrame([
+                    {"Actual": "Normal (0)", "Predicted": "Normal (0)", "Count": _cm[0][0]},
+                    {"Actual": "Normal (0)", "Predicted": "Threat (1)", "Count": _cm[0][1]},
+                    {"Actual": "Threat (1)", "Predicted": "Normal (0)", "Count": _cm[1][0]},
+                    {"Actual": "Threat (1)", "Predicted": "Threat (1)", "Count": _cm[1][1]},
+                ])
+                _max_cnt = max([row["Count"] for row in _cm_data.to_dict("records")] or [1])
+                _rect = alt.Chart(_cm_data).mark_rect().encode(
+                    x=alt.X("Predicted:N", title="Predicted Class", sort=["Normal (0)", "Threat (1)"]),
+                    y=alt.Y("Actual:N", title="Actual Class", sort=["Threat (1)", "Normal (0)"]),
+                    color=alt.Color("Count:Q", scale=alt.Scale(scheme="tealblues"), legend=None),
+                    tooltip=["Actual", "Predicted", "Count"],
+                )
+                _text = alt.Chart(_cm_data).mark_text(baseline="middle", fontSize=18, fontWeight="bold").encode(
+                    x="Predicted:N",
+                    y=alt.Y("Actual:N", sort=["Threat (1)", "Normal (0)"]),
+                    text=alt.Text("Count:Q"),
+                    color=alt.condition(alt.datum.Count > _max_cnt / 2, alt.value("white"), alt.value("black")),
+                )
+                st.altair_chart((_rect + _text).properties(height=280), use_container_width=True)
+
+            with _cm_cal_col2:
+                st.markdown(f'<p style="font-weight:600;font-size:0.95rem;color:{_p5["text"]};">Calibration Reliability Curve (ECE: {_ho["ece_after"]:.4f})</p>', unsafe_allow_html=True)
+                _cal_cal = _ho["calibration_curve_cal"]
+                _cal_uncal = _ho["calibration_curve_uncal"]
+                _cal_rows = []
+                for _pred_p, _true_p in zip(_cal_cal["prob_pred"], _cal_cal["prob_true"]):
+                    _cal_rows.append({"Predicted": _pred_p, "Actual": _true_p, "Calibration": "Calibrated (Isotonic)"})
+                for _pred_p, _true_p in zip(_cal_uncal["prob_pred"], _cal_uncal["prob_true"]):
+                    _cal_rows.append({"Predicted": _pred_p, "Actual": _true_p, "Calibration": "Uncalibrated RF"})
+                _cal_df = pd.DataFrame(_cal_rows)
+
+                _cal_line = alt.Chart(_cal_df).mark_line(point=True, strokeWidth=2).encode(
+                    x=alt.X("Predicted:Q", title="Mean Predicted Probability", scale=alt.Scale(domain=[0, 1])),
+                    y=alt.Y("Actual:Q", title="Fraction of Positives", scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("Calibration:N", scale=alt.Scale(domain=["Calibrated (Isotonic)", "Uncalibrated RF"], range=["#2DD4BF", "#F59E0B"]), legend=alt.Legend(orient="bottom", title=None)),
+                    tooltip=["Calibration:N", alt.Tooltip("Predicted:Q", format=".3f"), alt.Tooltip("Actual:Q", format=".3f")],
+                )
+                _cal_diag = alt.Chart(_diag_df).mark_line(
+                    strokeDash=[4, 4], color="#94A3B8"
+                ).encode(x="x:Q", y="y:Q")
+                st.altair_chart((_cal_line + _cal_diag).properties(height=280), use_container_width=True)
+
+            # ── 5. Per-Attack-Type Recall and Generalisation Results ──
+            _tab5_bottom_col1, _tab5_bottom_col2 = st.columns(2)
+
+            with _tab5_bottom_col1:
+                st.markdown(f'<p style="font-weight:600;font-size:0.95rem;color:{_p5["text"]};">Per-Attack-Type Recall</p>', unsafe_allow_html=True)
+                _ptr = _ho["per_type_recall"]
+                _ptr_rows = [
+                    {
+                        "Threat Vector": _atk,
+                        "Recall Rate": f"{_rec * 100:.1f}%",
+                        "Status": "✅ Optimal" if _rec >= 0.90 else "⚠️ Flagged",
+                    }
+                    for _atk, _rec in _ptr.items()
+                ]
+                st.dataframe(pd.DataFrame(_ptr_rows), use_container_width=True, hide_index=True)
+
+            with _tab5_bottom_col2:
+                st.markdown(f'<p style="font-weight:600;font-size:0.95rem;color:{_p5["text"]};">Generalisation Test (Unseen 1500-Record Dataset, Seed=999)</p>', unsafe_allow_html=True)
+                if _eval_res.get("generalisation") and "table" in _eval_res["generalisation"]:
+                    st.dataframe(_eval_res["generalisation"]["table"], use_container_width=True, hide_index=True)
+                else:
+                    st.info("Generalisation test pending.")
+
+            st.caption(
+                "Measured on held-out synthetic data from MITHYA's own generator. "
+                "Real-world performance will be lower and must be validated on labelled case data."
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 6: CLUSTERS & COMMUNITIES
+# ═══════════════════════════════════════════════════════════════════════════
+
+with tab6:
+    _p6 = _get_palette()
+    st.markdown(
+        f'<p style="color:{_p6["muted"]};font-size:0.88rem;margin-bottom:0.6rem;">'
+        "Entity-level behavioural clustering via HDBSCAN and structural community detection via Louvain modularity."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    import clustering
+
+    _clustering_key = f"clustering_profile_{len(df)}_{file_hash}"
+    if _clustering_key not in st.session_state:
+        with st.spinner("👥 Computing behavioural clusters and graph communities..."):
+            _, _profile_df = clustering.apply_clustering_to_transactions(df, features_df)
+            st.session_state[_clustering_key] = _profile_df
+    _profile_df = st.session_state[_clustering_key]
+
+    # Metrics overview cards
+    _n_entities = len(_profile_df)
+    _n_clusters = _profile_df["behaviour_cluster"].nunique() if "behaviour_cluster" in _profile_df.columns else 0
+    _n_outliers = int((_profile_df["behaviour_cluster"] == "Behavioural outlier").sum()) if "behaviour_cluster" in _profile_df.columns else 0
+    _n_comms = _profile_df["graph_community"].nunique() if "graph_community" in _profile_df.columns else 0
+
+    st.markdown(
+        f"""
+        <div class="bento-grid" style="grid-template-columns: repeat(4, 1fr); margin-bottom: 1.2rem;">
+            <div class="bento-card card-blue">
+                <div class="card-icon">👥</div>
+                <div class="card-label">Profiled Entities</div>
+                <div class="card-value">{_n_entities:,}</div>
+                <div class="card-sub">Common-Input clustered wallets</div>
+            </div>
+            <div class="bento-card card-purple">
+                <div class="card-icon">🧩</div>
+                <div class="card-label">HDBSCAN Clusters</div>
+                <div class="card-value">{_n_clusters}</div>
+                <div class="card-sub">Density-based behavioural groupings</div>
+            </div>
+            <div class="bento-card card-red">
+                <div class="card-icon">🚨</div>
+                <div class="card-label">Outlier Entities</div>
+                <div class="card-value">{_n_outliers}</div>
+                <div class="card-sub">Atypical behaviour profiles</div>
+            </div>
+            <div class="bento-card card-green">
+                <div class="card-icon">🕸️</div>
+                <div class="card-label">Graph Communities</div>
+                <div class="card-value">{_n_comms}</div>
+                <div class="card-sub">Louvain modularity partitions</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── 1. Altair Scatter of PCA x/y ──
+    # colour = cluster, size = mean_risk_score, tooltip = entity details
+    st.markdown(f'<h4 style="color:{_p6["accent"]};margin-top:0.8rem;margin-bottom:0.4rem;">Entity Behavioural Space (2D PCA Projection)</h4>', unsafe_allow_html=True)
+
+    _pca_chart = alt.Chart(_profile_df).mark_circle().encode(
+        x=alt.X("pca_x:Q", title="PCA Dimension 1 (Variance Axis 1)"),
+        y=alt.Y("pca_y:Q", title="PCA Dimension 2 (Variance Axis 2)"),
+        color=alt.Color(
+            "behaviour_cluster:N",
+            scale=alt.Scale(scheme="tableau20"),
+            legend=alt.Legend(title="Behaviour Cluster", orient="top", columns=4),
+        ),
+        size=alt.Size(
+            "mean_risk_score:Q",
+            title="Avg Risk Score",
+            scale=alt.Scale(domain=[0, 100], range=[40, 360]),
+            legend=alt.Legend(title="Avg Risk", orient="right"),
+        ),
+        tooltip=[
+            alt.Tooltip("entity_id:N", title="Entity ID"),
+            alt.Tooltip("behaviour_cluster:N", title="Cluster"),
+            alt.Tooltip("graph_community:N", title="Community"),
+            alt.Tooltip("tx_count:Q", title="Transaction Count"),
+            alt.Tooltip("total_btc:Q", title="Total BTC", format=".2f"),
+            alt.Tooltip("mean_risk_score:Q", title="Mean Risk Score", format=".1f"),
+            alt.Tooltip("night_share:Q", title="Night Share (00-05h)", format=".1%"),
+            alt.Tooltip("distinct_src_ips:Q", title="Distinct IPs"),
+            alt.Tooltip("mean_fan_out:Q", title="Mean Fan-Out", format=".1f"),
+            alt.Tooltip("mean_port_risk:Q", title="Mean Port Risk", format=".1f"),
+        ],
+    ).properties(height=380)
+
+    st.altair_chart(
+        _pca_chart.configure(
+            background=_p6.get("chart_bg", "transparent")
+        ).configure_view(strokeWidth=0),
+        use_container_width=True,
+    )
+
+    # ── 2. Cluster Table and Community Table ──
+    _tbl_col1, _tbl_col2 = st.columns(2)
+
+    _cluster_summary = clustering.build_cluster_summary_table(df, _profile_df)
+    _comm_summary = clustering.build_community_summary_table(df, _profile_df)
+
+    with _tbl_col1:
+        st.markdown(f'<h5 style="color:{_p6["text"]};margin-bottom:0.4rem;">Behavioural Clusters Summary</h5>', unsafe_allow_html=True)
+        st.dataframe(_cluster_summary, use_container_width=True, hide_index=True)
+        st.download_button(
+            "📥 Download Cluster Table (CSV)",
+            data=_cluster_summary.to_csv(index=False),
+            file_name="behaviour_clusters_summary.csv",
+            mime="text/csv",
+            key="btn_download_cluster_csv",
+        )
+
+    with _tbl_col2:
+        st.markdown(f'<h5 style="color:{_p6["text"]};margin-bottom:0.4rem;">Graph Communities Summary (Louvain)</h5>', unsafe_allow_html=True)
+        st.dataframe(_comm_summary, use_container_width=True, hide_index=True)
+        st.download_button(
+            "📥 Download Community Table (CSV)",
+            data=_comm_summary.to_csv(index=False),
+            file_name="graph_communities_summary.csv",
+            mime="text/csv",
+            key="btn_download_comm_csv",
         )
 
 

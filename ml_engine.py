@@ -39,6 +39,8 @@ from features import (
 from anomaly_engine import (
     compute_anomaly_deviation_scores,
     compute_investigative_priority,
+    compute_fused_priority,
+    assign_risk_tier,
 )
 
 # ── Percentile-based explainability (delegated to explainability module) ─
@@ -69,6 +71,102 @@ WHITELIST_CSV = os.path.join("sample_data", "institutional_whitelist.csv")
 CONTAMINATION = 0.05
 
 MICRO_TX_THRESHOLD = 0.006
+
+# ── Structural-type detector constants ──────────────────────────────────
+PEEL_MIN_CHAIN_LENGTH = 2
+FANOUT_MIN_OUTPUTS = 5
+FANOUT_MAX_INPUTS = 2
+FEE_URGENCY_THRESHOLD = 0.01
+
+
+def classify_structural_type(df: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
+    """
+    Classify each transaction into a detector-based structural type.
+
+    Uses rule-based checks on the engineered features — first match wins:
+      1. is_mixer_transaction(row) → ``"CoinJoin_Mixer"``
+      2. peel_chain_length >= PEEL_MIN_CHAIN_LENGTH → ``"Peel_Chain"``
+      3. fan_out >= FANOUT_MIN_OUTPUTS and fan_in <= FANOUT_MAX_INPUTS → ``"FanOut_Dispersal"``
+      4. fee_rate_urgency >= FEE_URGENCY_THRESHOLD → ``"Fee_Spike"``
+      5. otherwise → ``"Normal_P2P"``
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The transaction DataFrame (needed for ``is_mixer_transaction``).
+    features : pd.DataFrame
+        The engineered feature matrix (same row order as *df*).
+
+    Returns
+    -------
+    pd.Series
+        A string Series (same index as *df*) with the detected type.
+    """
+    result = pd.Series("Normal_P2P", index=df.index)
+
+    for idx in df.index:
+        row = df.loc[idx]
+        feat = features.loc[idx]
+
+        # Rule 1: CoinJoin / Mixer
+        if is_mixer_transaction(row):
+            result.at[idx] = "CoinJoin_Mixer"
+            continue
+
+        # Rule 2: Peel chain
+        if feat.get("peel_chain_length", 0) >= PEEL_MIN_CHAIN_LENGTH:
+            result.at[idx] = "Peel_Chain"
+            continue
+
+        # Rule 3: Fan-out dispersal
+        if (feat.get("fan_out", 0) >= FANOUT_MIN_OUTPUTS
+                and feat.get("fan_in", 0) <= FANOUT_MAX_INPUTS):
+            result.at[idx] = "FanOut_Dispersal"
+            continue
+
+        # Rule 4: Fee spike
+        if feat.get("fee_rate_urgency", 0) >= FEE_URGENCY_THRESHOLD:
+            result.at[idx] = "Fee_Spike"
+            continue
+
+        # Rule 5: fallthrough → Normal_P2P (already default)
+
+    return result
+
+
+def finalize_detected_type(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply institutional-whitelist override to ``detected_type``.
+
+    Where ``whitelisted_side`` is not null **and** ``detected_type`` is
+    one of ``"Normal_P2P"``, ``"FanOut_Dispersal"`` or ``"Fee_Spike"``,
+    the detected type is changed to ``"Whitelisted_Institutional"``.
+
+    Mixer and peel-chain rows keep their original detected type because
+    the structural signal is forensically significant regardless of
+    whether one side is institutional.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain ``detected_type`` and ``whitelisted_side`` columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        The same DataFrame (mutated in-place) with updated ``detected_type``.
+    """
+    if "whitelisted_side" not in df.columns or "detected_type" not in df.columns:
+        return df
+
+    overridable = {"Normal_P2P", "FanOut_Dispersal", "Fee_Spike"}
+    mask = (
+        df["whitelisted_side"].notna()
+        & df["detected_type"].isin(overridable)
+    )
+    df.loc[mask, "detected_type"] = "Whitelisted_Institutional"
+    return df
+
 
 # ── Port-risk scoring constants ─────────────────────────────────────────
 # Standard Bitcoin P2P ports (mainnet + testnet) → baseline risk = 0.0
@@ -621,8 +719,13 @@ def score_port_risk(port, port_freq: Dict[int, float] | None = None) -> float:
     if p in ANON_PROXY_PORTS:
         return 1.0               # confirmed anonymisation tooling
 
+    # Legacy compatibility check
+    if isinstance(port_freq, (int, float)):
+        if p == 6667:
+            return 0.6
+
     # Rarity-based scoring for all other ports
-    if port_freq is not None:
+    if isinstance(port_freq, dict):
         freq = port_freq.get(p, 0.0)
         # Invert: rare ports (low freq) → high risk
         # Cap at 0.8 to keep Tor/I2P at the top of the scale
@@ -1141,6 +1244,8 @@ def apply_institutional_whitelist(
     # Pre-populate annotation columns
     df["whitelisted_side"] = None
     df["whitelisted_entity"] = None
+    if "explanation" not in df.columns:
+        df["explanation"] = ""
 
     for idx in df.index:
         input_match, input_inst = _check_side(
@@ -1168,13 +1273,9 @@ def apply_institutional_whitelist(
 
         elif input_match:
             # ── Only input side is regulated ──────────────────────
-            # Discount risk but DO NOT zero it — the output side
-            # (recipient) is unverified and could be criminal.
-            original_risk = float(df.at[idx, "risk_score"])
-            discounted = round(original_risk * _SINGLE_SIDE_DISCOUNT, 2)
-            df.at[idx, "risk_score"] = discounted
-            # Preserve is_anomaly — anomaly status reflects the
-            # unverified counterparty, not the regulated side.
+            # Risk discount is deferred to compute_fused_priority
+            # via whitelist_factor.  We annotate but do NOT modify
+            # risk_score here.
             existing_expl = str(df.at[idx, "explanation"])
             df.at[idx, "explanation"] = (
                 f"Regulated Entity ({input_inst}) on input side; "
@@ -1186,12 +1287,8 @@ def apply_institutional_whitelist(
 
         elif output_match:
             # ── Only output side is regulated ─────────────────────
-            # This is the critical case: a potentially criminal
-            # sender depositing to a regulated exchange.  Risk must
-            # NOT be zeroed — the sender is the suspect.
-            original_risk = float(df.at[idx, "risk_score"])
-            discounted = round(original_risk * _SINGLE_SIDE_DISCOUNT, 2)
-            df.at[idx, "risk_score"] = discounted
+            # Risk discount is deferred to compute_fused_priority
+            # via whitelist_factor.
             existing_expl = str(df.at[idx, "explanation"])
             df.at[idx, "explanation"] = (
                 f"Regulated Entity ({output_inst}) on output side; "
@@ -1205,7 +1302,7 @@ def apply_institutional_whitelist(
         f"[*] Institutional whitelist: {both_cleared}/{len(df)} transactions "
         f"fully cleared (both sides institutional, risk → 0.0). "
         f"{single_discounted}/{len(df)} transactions discounted "
-        f"(single-side match, risk × {_SINGLE_SIDE_DISCOUNT})."
+        f"(single-side match, whitelist_factor={_SINGLE_SIDE_DISCOUNT})."
     )
     return df
 
@@ -1218,6 +1315,270 @@ def export_results(df: pd.DataFrame, filepath: str = OUTPUT_CSV) -> str:
     df.to_csv(filepath, index=False)
     _log(f"[*] Results saved to {filepath}")
     return filepath
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6b. KNOWN-BAD WATCHLIST & TAINT PROPAGATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+WATCHLIST_DEFAULT = os.path.join("sample_data", "watchlist.csv")
+_TAINT_MAX_NODES = 300_000
+
+
+def load_watchlist(path: str = WATCHLIST_DEFAULT) -> Dict[str, list]:
+    """
+    Load a known-bad watchlist CSV and return per-type indicator dicts.
+
+    Returns
+    -------
+    dict
+        Keys: ``"address"``, ``"ip"``, ``"asn"``.
+        Each value is a list of dicts with ``indicator``, ``label``,
+        ``severity``.
+    """
+    result: Dict[str, list] = {"address": [], "ip": [], "asn": []}
+    if not os.path.isfile(path):
+        _log(f"[!] Watchlist file not found: {path}")
+        return result
+    try:
+        wl_df = pd.read_csv(path)
+        for _, row in wl_df.iterrows():
+            t = str(row.get("type", "")).strip().lower()
+            if t in result:
+                raw_ind = str(row["indicator"]).strip()
+                result[t].append({
+                    "indicator": raw_ind,
+                    "label": str(row.get("label", "")),
+                    "severity": float(row.get("severity", 0.5)),
+                })
+        total = sum(len(v) for v in result.values())
+        _log(f"[*] Loaded {total} watchlist indicators from '{path}' "
+             f"(addr={len(result['address'])}, ip={len(result['ip'])}, asn={len(result['asn'])})")
+    except Exception as exc:
+        _log(f"[!] Error loading watchlist: {exc}")
+    return result
+
+
+def apply_watchlist(df: pd.DataFrame, watchlist: Dict[str, list] | None = None,
+                    path: str = WATCHLIST_DEFAULT) -> pd.DataFrame:
+    """
+    Annotate transactions with watchlist matches.
+
+    Adds columns: ``watchlist_hit`` (bool), ``watchlist_label`` (str),
+    ``watchlist_indicator`` (str).
+    """
+    if watchlist is None:
+        watchlist = load_watchlist(path)
+
+    addr_set = {e["indicator"].lower(): e for e in watchlist.get("address", [])}
+    ip_set = {e["indicator"].lower(): e for e in watchlist.get("ip", [])}
+    asn_set = {e["indicator"].lower(): e for e in watchlist.get("asn", [])}
+
+    df["watchlist_hit"] = False
+    df["watchlist_label"] = None
+    df["watchlist_indicator"] = None
+
+    hits = 0
+    for idx in df.index:
+        # Check addresses (input + output)
+        for col in ("input_addresses", "output_addresses"):
+            if col not in df.columns:
+                continue
+            raw = str(df.at[idx, col]).strip()
+            if raw in ("", "nan", "None"):
+                continue
+            for addr in raw.split("|"):
+                a = addr.strip().lower()
+                if a in addr_set:
+                    df.at[idx, "watchlist_hit"] = True
+                    df.at[idx, "watchlist_label"] = addr_set[a]["label"]
+                    df.at[idx, "watchlist_indicator"] = addr_set[a]["indicator"]
+                    hits += 1
+                    break
+            if df.at[idx, "watchlist_hit"]:
+                break
+
+        if df.at[idx, "watchlist_hit"]:
+            continue
+
+        # Check src_ip
+        if "src_ip" in df.columns:
+            ip_val = str(df.at[idx, "src_ip"]).strip().lower()
+            if ip_val in ip_set:
+                df.at[idx, "watchlist_hit"] = True
+                df.at[idx, "watchlist_label"] = ip_set[ip_val]["label"]
+                df.at[idx, "watchlist_indicator"] = ip_set[ip_val]["indicator"]
+                hits += 1
+                continue
+
+        # Check ASN
+        if "asn" in df.columns:
+            asn_val = str(df.at[idx, "asn"]).strip().lower()
+            if asn_val in asn_set:
+                df.at[idx, "watchlist_hit"] = True
+                df.at[idx, "watchlist_label"] = asn_set[asn_val]["label"]
+                df.at[idx, "watchlist_indicator"] = asn_set[asn_val]["indicator"]
+                hits += 1
+
+    _log(f"[*] Watchlist scan: {hits}/{len(df)} transactions matched known-bad indicators.")
+    return df
+
+
+def compute_taint(df: pd.DataFrame, watchlist: Dict[str, list] | None = None,
+                  path: str = WATCHLIST_DEFAULT) -> pd.DataFrame:
+    """
+    Build a bipartite graph (tx ↔ address/IP) and run PageRank-based
+    taint propagation from watchlist indicators.
+
+    Adds columns: ``taint_score`` (0–100), ``taint_hops`` (int or None).
+    Also updates ``explanation`` strings with forensic watchlist/taint context.
+    """
+    import networkx as nx
+
+    if watchlist is None:
+        watchlist = load_watchlist(path)
+
+    df["taint_score"] = 0.0
+    df["taint_hops"] = None
+
+    all_indicators = {e["indicator"].lower(): e["severity"]
+                      for entries in watchlist.values()
+                      for e in entries}
+    indicator_labels = {e["indicator"].lower(): e.get("label", "Threat Indicator")
+                        for entries in watchlist.values()
+                        for e in entries}
+    if not all_indicators:
+        return df
+
+    # Build undirected graph: tx nodes ↔ address nodes ↔ IP nodes
+    G = nx.Graph()
+
+    for idx in df.index:
+        txid = str(df.at[idx, "txid"])
+        tx_node = f"tx:{txid}"
+        G.add_node(tx_node, kind="tx")
+
+        # Address neighbours
+        for col in ("input_addresses", "output_addresses"):
+            if col not in df.columns:
+                continue
+            raw = str(df.at[idx, col]).strip()
+            if raw in ("", "nan", "None"):
+                continue
+            for addr in raw.split("|"):
+                a = addr.strip().lower()
+                if a:
+                    a_node = f"addr:{a}"
+                    G.add_node(a_node, kind="address")
+                    G.add_edge(tx_node, a_node)
+
+        # IP neighbour
+        if "src_ip" in df.columns:
+            ip_val = str(df.at[idx, "src_ip"]).strip().lower()
+            if ip_val and ip_val not in ("", "nan", "none"):
+                ip_node = f"ip:{ip_val}"
+                G.add_node(ip_node, kind="ip")
+                G.add_edge(tx_node, ip_node)
+
+    n_nodes = G.number_of_nodes()
+    _log(f"[*] Taint graph: {n_nodes} nodes, {G.number_of_edges()} edges.")
+
+    if n_nodes > _TAINT_MAX_NODES:
+        _log(f"[!] Taint graph too large ({n_nodes} > {_TAINT_MAX_NODES}). Skipping PageRank.")
+        return df
+
+    # Build personalisation vector from watchlist indicators
+    personalization = {}
+    watchlist_nodes = set()
+    node_to_label = {}
+    for indicator, severity in all_indicators.items():
+        for prefix in ("addr:", "ip:"):
+            node = f"{prefix}{indicator}"
+            if node in G:
+                personalization[node] = severity
+                watchlist_nodes.add(node)
+                node_to_label[node] = indicator_labels.get(indicator, "Threat Indicator")
+
+    if not personalization:
+        _log("[!] No watchlist indicators found in graph. Taint = 0.")
+        return df
+
+    # Run PageRank
+    try:
+        pr = nx.pagerank(G, alpha=0.85, personalization=personalization, max_iter=100)
+    except Exception as exc:
+        _log(f"[!] PageRank failed: {exc}. Taint = 0.")
+        return df
+
+    # For each tx: taint = max PageRank of tx node + its neighbours
+    tx_scores = {}
+    for idx in df.index:
+        txid = str(df.at[idx, "txid"])
+        tx_node = f"tx:{txid}"
+        if tx_node not in G:
+            continue
+        candidates = [pr.get(tx_node, 0.0)]
+        for neighbour in G.neighbors(tx_node):
+            candidates.append(pr.get(neighbour, 0.0))
+        tx_scores[idx] = max(candidates)
+
+    # Min-max scale to 0–100
+    if tx_scores:
+        vals = list(tx_scores.values())
+        mn, mx = min(vals), max(vals)
+        if mx > mn:
+            for idx, v in tx_scores.items():
+                df.at[idx, "taint_score"] = round((v - mn) / (mx - mn) * 100.0, 1)
+        elif mx > 0:
+            for idx in tx_scores:
+                df.at[idx, "taint_score"] = 50.0  # all equal, non-zero
+
+    # Compute taint_hops: shortest path to nearest watchlist node, capped at 4
+    for idx in df.index:
+        txid = str(df.at[idx, "txid"])
+        tx_node = f"tx:{txid}"
+        if tx_node not in G:
+            continue
+        min_hops = None
+        nearest_label = None
+        for wl_node in watchlist_nodes:
+            try:
+                path_len = nx.shortest_path_length(G, source=tx_node, target=wl_node)
+                if min_hops is None or path_len < min_hops:
+                    min_hops = path_len
+                    nearest_label = node_to_label.get(wl_node, "Threat Indicator")
+            except nx.NetworkXNoPath:
+                continue
+        if min_hops is not None:
+            df.at[idx, "taint_hops"] = min(min_hops, 4)
+            df.at[idx, "taint_nearest_label"] = nearest_label
+
+    # ── Forensic context prepending for explanations ──
+    if "explanation" in df.columns:
+        for idx in df.index:
+            hit = bool(df.at[idx, "watchlist_hit"]) if "watchlist_hit" in df.columns else False
+            hops = df.at[idx, "taint_hops"] if "taint_hops" in df.columns else None
+            existing = str(df.at[idx, "explanation"] or "").strip()
+
+            prefix = ""
+            if hit:
+                lbl = str(df.at[idx, "watchlist_label"] or "Threat Indicator")
+                ind = str(df.at[idx, "watchlist_indicator"] or "")
+                prefix = f"Direct watchlist match: {lbl} ({ind})"
+            elif hops is not None and pd.notna(hops) and 1 <= int(hops) <= 3:
+                lbl = str(df.at[idx, "taint_nearest_label"] or "Threat Indicator") if "taint_nearest_label" in df.columns else "Threat Indicator"
+                prefix = f"{int(hops)} hop(s) from known-bad indicator ({lbl})"
+
+            if prefix and not existing.startswith(prefix):
+                if existing and existing != "Normal.":
+                    df.at[idx, "explanation"] = f"{prefix}. {existing}"
+                else:
+                    df.at[idx, "explanation"] = f"{prefix}."
+
+    # Watchlist direct hits get score_graph = 100 (enforced later in fused scoring)
+    tainted = (df["taint_score"] > 0).sum()
+    _log(f"[*] Taint propagation: {tainted}/{len(df)} transactions have non-zero taint.")
+    return df
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 7. FULL PIPELINE ENTRIES
@@ -1250,6 +1611,7 @@ def run_pipeline(
     # ── Legacy path (no adapter) ─────────────────────────────────
     df = load_data(input_csv)
     features, df = engineer_features(df)
+    df["detected_type"] = classify_structural_type(df, features)
     model, predictions, raw_scores = train_model(features, contamination=contamination)
     risk_scores = compute_anomaly_deviation_scores(raw_scores)
     dataset_profile = _build_dataset_profile(features)
@@ -1258,6 +1620,26 @@ def run_pipeline(
 
     # ── Institutional Whitelist Override ──
     enriched_df = apply_institutional_whitelist(enriched_df)
+    finalize_detected_type(enriched_df)
+    _wl = load_watchlist()
+    apply_watchlist(enriched_df, _wl)
+    compute_taint(enriched_df, _wl)
+    if "attack_type" in enriched_df.columns and "ml_probability" not in enriched_df.columns:
+        try:
+            X_inf = select_informative_features(features)
+            y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.calibration import CalibratedClassifierCV
+            from sklearn.model_selection import StratifiedKFold, cross_val_predict
+            _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=-1)
+            _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
+            _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=-1)[:, 1]
+            enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+        except Exception:
+            pass
+    compute_fused_priority(enriched_df, features)
+    enriched_df["risk_tier"] = enriched_df["risk_score"].apply(assign_risk_tier)
 
     export_results(enriched_df, output_csv)
 
@@ -1310,6 +1692,7 @@ def run_pipeline_from_df(
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
     features, df = engineer_features(df)
+    df["detected_type"] = classify_structural_type(df, features)
     model, predictions, raw_scores = train_model(features, contamination=contamination)
     risk_scores = compute_anomaly_deviation_scores(raw_scores)
     dataset_profile = _build_dataset_profile(features)
@@ -1317,6 +1700,26 @@ def run_pipeline_from_df(
 
     # ── Institutional Whitelist Override ──
     enriched_df = apply_institutional_whitelist(enriched_df)
+    finalize_detected_type(enriched_df)
+    _wl = load_watchlist()
+    apply_watchlist(enriched_df, _wl)
+    compute_taint(enriched_df, _wl)
+    if "attack_type" in enriched_df.columns and "ml_probability" not in enriched_df.columns:
+        try:
+            X_inf = select_informative_features(features)
+            y = (~enriched_df["attack_type"].isin({"Normal_P2P", "Whitelisted_Institutional"})).astype(int).values
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.calibration import CalibratedClassifierCV
+            from sklearn.model_selection import StratifiedKFold, cross_val_predict
+            _base_rf = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=42, n_jobs=-1)
+            _cal_model = CalibratedClassifierCV(estimator=_base_rf, method="isotonic", cv=3)
+            _cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            _probas = cross_val_predict(_cal_model, X_inf, y, cv=_cv, method="predict_proba", n_jobs=-1)[:, 1]
+            enriched_df["ml_probability"] = (_probas * 100.0).round(2)
+        except Exception:
+            pass
+    compute_fused_priority(enriched_df, features)
+    enriched_df["risk_tier"] = enriched_df["risk_score"].apply(assign_risk_tier)
 
     return enriched_df, model, features
 

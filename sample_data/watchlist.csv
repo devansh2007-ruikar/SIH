@@ -1,0 +1,11 @@
+indicator,type,label,severity
+bc1qLPhVoocP5KOJWZKgVZVbKQhZ1CR9KP0NGB3TuK,address,Ransomware_Payout,1.0
+11luTNKllfpPLkSgFF176VjK1HCn4VOZLo,address,Ransomware_Payout,1.0
+1ZeMGqc0tLdDkwsFunR4YoLKVhDrTLj4W3,address,Ransomware_Payout,1.0
+bc1qqhNJpJjzTtgGR7dklnuWkPUHJzj5j7IYsoTKWa,address,Sanctioned_Mixer_User,0.8
+1NUhkysUUHxRDi1a5BQ7Qc4N7A41uqgOyV,address,Sanctioned_Mixer_User,0.8
+72.174.184.67,ip,Tor_Exit_Node,0.6
+221.108.180.212,ip,Tor_Exit_Node,0.6
+14.27.107.183,ip,Tor_Exit_Node,0.6
+AS63949,asn,Bulletproof_Hosting,0.5
+AS44477,asn,Bulletproof_Hosting,0.5
