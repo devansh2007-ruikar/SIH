@@ -85,6 +85,27 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+@st.cache_resource
+def load_rf_model(model_path: str = "models/rf_model.joblib"):
+    """Load pre-trained calibrated Random Forest model with Streamlit resource caching."""
+    if os.path.isfile(model_path):
+        try:
+            import joblib
+            return joblib.load(model_path)
+        except Exception:
+            return None
+    return None
+
+_cached_rf_model = load_rf_model()
+try:
+    import ml_engine
+    if _cached_rf_model is not None:
+        ml_engine._CACHED_RF_MODEL = _cached_rf_model
+        ml_engine._CACHED_RF_LOADED = True
+except Exception:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Theme Palettes & CSS — Light / Dark with CSS Variables
 # ---------------------------------------------------------------------------
@@ -681,56 +702,60 @@ with st.sidebar:
     # ── Section 2: Model Controls ──
     st.markdown("##### 🎛️ Model Controls")
 
-    contamination = st.slider(
-        "Anomaly Sensitivity",
-        min_value=0.01,
-        max_value=0.30,
-        value=0.05,
-        step=0.01,
-        help="Expected fraction of anomalous transactions. "
-             "Higher = more flags, lower = stricter.",
-    )
+    with st.form("model_controls"):
+        contamination = st.slider(
+            "Anomaly Sensitivity",
+            min_value=0.01,
+            max_value=0.30,
+            value=0.05,
+            step=0.01,
+            help="Expected fraction of anomalous transactions. "
+                 "Higher = more flags, lower = stricter.",
+        )
+        st.form_submit_button("Apply", use_container_width=True)
 
     st.markdown("---")
 
     # ── Section 3: Live Data Generator ──
     st.markdown("##### ⚡ Synthetic Data Generator")
 
-    gen_records = st.number_input(
-        "Total Records",
-        min_value=500,
-        max_value=5000,
-        value=1500,
-        step=500,
-        help="Number of synthetic transactions to generate.",
-    )
+    with st.form("data_generator"):
+        gen_records = st.number_input(
+            "Total Records",
+            min_value=500,
+            max_value=5000,
+            value=1500,
+            step=500,
+            help="Number of synthetic transactions to generate.",
+        )
 
-    gen_ratio = st.slider(
-        "Suspicious Ratio",
-        min_value=0.05,
-        max_value=0.50,
-        value=0.20,
-        step=0.05,
-        help="Fraction of transactions that are threat vectors.",
-    )
+        gen_ratio = st.slider(
+            "Suspicious Ratio",
+            min_value=0.05,
+            max_value=0.50,
+            value=0.20,
+            step=0.05,
+            help="Fraction of transactions that are threat vectors.",
+        )
 
-    if st.button("🔄 Regenerate Data", width="stretch", type="primary"):
-        with st.spinner("Generating synthetic data..."):
-            result = subprocess.run(
-                [
-                    PYTHON_BIN, "generate_data.py",
-                    "--total-records", str(gen_records),
-                    "--suspicious-ratio", str(gen_ratio),
-                ],
-                capture_output=True,
-                text=True,
-                cwd=os.path.dirname(__file__) or ".",
-            )
-            if result.returncode == 0:
-                st.success("Data regenerated!")
-                st.rerun()
-            else:
-                st.error(f"Generator failed:\n{result.stderr}")
+        gen_submitted = st.form_submit_button("🔄 Regenerate Data", use_container_width=True, type="primary")
+        if gen_submitted:
+            with st.spinner("Generating synthetic data..."):
+                result = subprocess.run(
+                    [
+                        PYTHON_BIN, "generate_data.py",
+                        "--total-records", str(gen_records),
+                        "--suspicious-ratio", str(gen_ratio),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    cwd=os.path.dirname(__file__) or ".",
+                )
+                if result.returncode == 0:
+                    st.success("Data regenerated!")
+                    st.rerun()
+                else:
+                    st.error(f"Generator failed:\n{result.stderr}")
 
     st.markdown("---")
 
@@ -825,10 +850,7 @@ if uploaded_watchlist is not None:
 
 
 def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float, start_time: Optional[float] = None):
-    """Run the full AI pipeline via the polymorphic adapter, then enrich with offline Geo-ASN."""
-    if start_time is None:
-        start_time = time.perf_counter()
-
+    """Run the AI detection pipeline via the polymorphic adapter."""
     if "geo_country" not in raw_df.columns:
         raw_df["geo_country"] = "XX"
     if hasattr(adapter, "REQUIRED_COLUMNS"):
@@ -837,25 +859,93 @@ def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float, start_time: Opt
     enriched_df, _model, features = adapter.run_pipeline_from_df(
         raw_df, contamination=cont,
     )
-    # Phase 4: offline ASN enrichment (no network I/O)
-    if _HAS_GEO_ASN and "src_ip" in enriched_df.columns:
-        enriched_df = _geo_enrich_df(enriched_df, ip_col="src_ip", inplace=False)
-    elif "asn" not in enriched_df.columns:
-        enriched_df["asn"] = "AS0"
-
-    # Ensure behavioural clustering & graph communities are present
-    if "behaviour_cluster" not in enriched_df.columns or "graph_community" not in enriched_df.columns:
-        try:
-            import clustering
-            enriched_df, _ = clustering.apply_clustering_to_transactions(enriched_df, features)
-        except Exception as _cl_err:
-            pass
-
-    _elapsed = time.perf_counter() - start_time
-    st.session_state["pipeline_elapsed_s"] = _elapsed
-    st.session_state["pipeline_tx_count"] = len(enriched_df)
-
     return enriched_df, features
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def run_full_pipeline(file_bytes, file_sha256, contamination, whitelist_sha, watchlist_sha, mode):
+    """Unified cached detection pipeline: parse → AI detection → Geo-ASN → Clustering."""
+    print("PIPELINE RUN")
+    _parse_start = time.perf_counter()
+    with st.status("Running MITHYA engine...", expanded=True) as status:
+        if status:
+            status.write("Parse")
+        if mode == "separate":
+            if b"\n---SPLIT---\n" in file_bytes:
+                net_bytes, chain_bytes = file_bytes.split(b"\n---SPLIT---\n", 1)
+            elif isinstance(file_bytes, (tuple, list)):
+                net_bytes, chain_bytes = file_bytes[0], file_bytes[1]
+            else:
+                net_bytes, chain_bytes = file_bytes, b""
+            net_df = pd.read_csv(io.BytesIO(net_bytes))
+            chain_df = pd.read_csv(io.BytesIO(chain_bytes))
+            merged, corr_stats = correlate_layers(net_df, chain_df)
+            if "geo_country" not in merged.columns:
+                merged["geo_country"] = "XX"
+            adapter = BitcoinCSVAdapter()
+            if hasattr(adapter, "REQUIRED_COLUMNS"):
+                adapter.REQUIRED_COLUMNS = [c for c in adapter.REQUIRED_COLUMNS if c != "geo_country"]
+            raw_df = adapter._validate_and_build_report(merged, source=None, fmt="CSV (correlated)")
+            if "geo_country" not in raw_df.columns:
+                raw_df["geo_country"] = "XX"
+            adapter.last_report["sha256"] = file_sha256
+            adapter.last_report["correlation"] = corr_stats
+        else:
+            ext = mode if mode.startswith(".") else f".{mode}"
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            try:
+                adapter = get_adapter(tmp_path)
+                raw_df = adapter.load(tmp_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            corr_stats = None
+
+        if "geo_country" not in raw_df.columns:
+            raw_df["geo_country"] = "XX"
+        if hasattr(adapter, "REQUIRED_COLUMNS"):
+            adapter.REQUIRED_COLUMNS = [c for c in adapter.REQUIRED_COLUMNS if c != "geo_country"]
+
+        if status:
+            status.write("Features")
+            status.write("Detect")
+            status.write("Score")
+            status.write("Taint")
+        df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
+
+        if status:
+            status.write("Geo")
+        if _HAS_GEO_ASN and "src_ip" in df.columns:
+            df = _geo_enrich_df(df, ip_col="src_ip", inplace=False)
+        elif "asn" not in df.columns:
+            df["asn"] = "AS0"
+
+        if status:
+            status.write("Clusters")
+        if "behaviour_cluster" not in df.columns or "graph_community" not in df.columns:
+            try:
+                import clustering
+                df, _ = clustering.apply_clustering_to_transactions(df, features_df)
+            except Exception:
+                pass
+
+        if status:
+            status.update(label="MITHYA engine complete", state="complete", expanded=False)
+
+    _elapsed = time.perf_counter() - _parse_start
+    stats = dict(getattr(adapter, "last_report", None) or {})
+    if corr_stats:
+        stats["correlation"] = corr_stats
+        stats["correlation_stats"] = corr_stats
+    stats["elapsed_s"] = _elapsed
+    stats["rows_read"] = stats.get("rows_read", len(raw_df))
+    stats["rows_valid"] = stats.get("rows_valid", len(df))
+    stats["file_hash"] = file_sha256
+    stats["weights"] = getattr(adapter, "WEIGHTS", None)
+
+    return df, features_df, stats
 
 
 @st.cache_data
@@ -879,180 +969,133 @@ def get_traceable_transactions(_df: pd.DataFrame, dataset_id: str) -> list[dict]
     return traceable
 
 
-import hashlib
-
 # Determine data source and load
 file_hash = "N/A"
 ingest_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 correlation_stats = None   # Populated only in separate-file mode
 _default_path = DEFAULT_DATASET if os.path.isfile(DEFAULT_DATASET) else _FALLBACK_DATASET
 
-# ── Helper: load separate files and correlate ──
-def _load_separate_files(net_source, chain_source, is_upload=False):
-    """Load network + blockchain CSVs, correlate on txid, and return (merged_df, adapter, hash, corr_stats)."""
-    if is_upload:
-        net_bytes = net_source.getvalue()
-        chain_bytes = chain_source.getvalue()
-        combined_hash = hashlib.sha256(net_bytes + chain_bytes).hexdigest()
-        net_df = pd.read_csv(io.BytesIO(net_bytes))
-        chain_df = pd.read_csv(io.BytesIO(chain_bytes))
-    else:
-        with open(net_source, "rb") as f1, open(chain_source, "rb") as f2:
-            b1, b2 = f1.read(), f2.read()
-        combined_hash = hashlib.sha256(b1 + b2).hexdigest()
-        net_df = pd.read_csv(net_source)
-        chain_df = pd.read_csv(chain_source)
+if uploaded_whitelist is not None:
+    whitelist_sha = hashlib.sha256(uploaded_whitelist.getvalue()).hexdigest()
+elif os.path.isfile("institutional_whitelist.csv"):
+    with open("institutional_whitelist.csv", "rb") as _f:
+        whitelist_sha = hashlib.sha256(_f.read()).hexdigest()
+elif os.path.isfile("sample_data/institutional_whitelist.csv"):
+    with open("sample_data/institutional_whitelist.csv", "rb") as _f:
+        whitelist_sha = hashlib.sha256(_f.read()).hexdigest()
+else:
+    whitelist_sha = "N/A"
 
-    merged, corr_stats = correlate_layers(net_df, chain_df)
-    if "geo_country" not in merged.columns:
-        merged["geo_country"] = "XX"
-
-    adapter = BitcoinCSVAdapter()
-    if hasattr(adapter, "REQUIRED_COLUMNS"):
-        adapter.REQUIRED_COLUMNS = [c for c in adapter.REQUIRED_COLUMNS if c != "geo_country"]
-
-    # Run validation/report on the merged result
-    merged = adapter._validate_and_build_report(merged, source=None, fmt="CSV (correlated)")
-    if "geo_country" not in merged.columns:
-        merged["geo_country"] = "XX"
-
-    adapter.last_report["sha256"] = combined_hash
-    adapter.last_report["correlation"] = corr_stats
-    return merged, adapter, combined_hash, corr_stats
-
+if uploaded_watchlist is not None:
+    watchlist_sha = hashlib.sha256(uploaded_watchlist.getvalue()).hexdigest()
+elif os.path.isfile("sample_data/watchlist.csv"):
+    with open("sample_data/watchlist.csv", "rb") as _f:
+        watchlist_sha = hashlib.sha256(_f.read()).hexdigest()
+elif os.path.isfile("watchlist.csv"):
+    with open("watchlist.csv", "rb") as _f:
+        watchlist_sha = hashlib.sha256(_f.read()).hexdigest()
+else:
+    watchlist_sha = "N/A"
 
 if upload_mode == "Separate network + blockchain files" and (uploaded_net_file or uploaded_chain_file):
-    # ── Separate-file mode ──
     if uploaded_net_file and uploaded_chain_file:
-        try:
-            _parse_start = time.perf_counter()
-            raw_df, adapter, file_hash, correlation_stats = _load_separate_files(
-                uploaded_net_file, uploaded_chain_file, is_upload=True,
-            )
-            with st.spinner("🧠 AI Engine running — detecting anomalies (correlated mode)..."):
-                df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
-                data_source = "uploaded_separate"
-
-            with st.sidebar:
-                _p = _get_palette()
-                st.markdown(
-                    f'<div class="upload-banner">'
-                    f"✅ Correlated <b>{correlation_stats['matched']}</b> txids · "
-                    f"<b>{(df['is_anomaly'].sum())}</b> flagged"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-        except Exception as e:
-            import traceback
-            st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
-            st.stop()
+        net_bytes = uploaded_net_file.getvalue()
+        chain_bytes = uploaded_chain_file.getvalue()
+        file_bytes = net_bytes + b"\n---SPLIT---\n" + chain_bytes
+        file_sha256 = hashlib.sha256(net_bytes + chain_bytes).hexdigest()
+        file_hash = file_sha256
+        mode = "separate"
+        data_source = "uploaded_separate"
     else:
         st.warning("⚠️ Please upload **both** the network telemetry and blockchain files.")
         st.stop()
-
 elif uploaded_file is not None:
-    try:
-        _parse_start = time.perf_counter()
-        # Calculate SHA-256 of uploaded file for data provenance
-        file_bytes = uploaded_file.getvalue()
-        file_hash = hashlib.sha256(file_bytes).hexdigest()
-
-        # Save to a temporary file so the adapter can determine format by extension
-        ext = os.path.splitext(uploaded_file.name)[1]
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-
-        try:
-            adapter = get_adapter(tmp_path)
-            raw_df = adapter.load(tmp_path)
-        finally:
-            os.remove(tmp_path)
-
-        with st.spinner("🧠 AI Engine running — detecting anomalies..."):
-            df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
-            data_source = "uploaded"
-
-        with st.sidebar:
-            _p = _get_palette()
-            st.markdown(
-                f'<div class="upload-banner">'
-                f"✅ Analysed <b>{len(raw_df)}</b> transactions · "
-                f"<b>{(df['is_anomaly'].sum())}</b> flagged"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<div style="font-size:0.75rem; color:{_p["muted"]}; padding:10px; background:{_p["card"]}; border-radius:4px; margin-bottom:10px; border:1px solid {_p["card_border"]};">'
-                f'<b>🔒 SHA-256 Source Hash:</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-    except Exception as e:
-        import traceback
-        st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
-        st.stop()
+    file_bytes = uploaded_file.getvalue()
+    file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+    file_hash = file_sha256
+    mode = os.path.splitext(uploaded_file.name)[1].lower() or ".csv"
+    data_source = "uploaded"
 else:
-    # ── Default dataset loading ──
-    # In separate mode without uploads, try the split files first
     _NET_DEFAULT = os.path.join("sample_data", "network_telemetry.csv")
     _CHAIN_DEFAULT = os.path.join("sample_data", "blockchain_tx.csv")
-
     if upload_mode == "Separate network + blockchain files" and os.path.isfile(_NET_DEFAULT) and os.path.isfile(_CHAIN_DEFAULT):
-        try:
-            _parse_start = time.perf_counter()
-            raw_df, adapter, file_hash, correlation_stats = _load_separate_files(
-                _NET_DEFAULT, _CHAIN_DEFAULT, is_upload=False,
-            )
-            with st.spinner("🧠 AI Engine running on default split dataset (correlated)..."):
-                df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
-                data_source = "default_separate"
-
-            with st.sidebar:
-                _p = _get_palette()
-                st.markdown(
-                    f'<div style="font-size:0.75rem; color:{_p["muted"]}; padding:10px; background:{_p["card"]}; border-radius:4px; margin-bottom:10px; border:1px solid {_p["card_border"]};">'
-                    f'<b>🔒 SHA-256 Source Hash (Correlated):</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-        except Exception as e:
-            import traceback
-            st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
-            st.stop()
+        with open(_NET_DEFAULT, "rb") as f1, open(_CHAIN_DEFAULT, "rb") as f2:
+            net_bytes, chain_bytes = f1.read(), f2.read()
+        file_bytes = net_bytes + b"\n---SPLIT---\n" + chain_bytes
+        file_sha256 = hashlib.sha256(net_bytes + chain_bytes).hexdigest()
+        file_hash = file_sha256
+        mode = "separate"
+        data_source = "default_separate"
     else:
-        # Standard single-file default path
         _default_path = DEFAULT_DATASET if os.path.isfile(DEFAULT_DATASET) else _FALLBACK_DATASET
         if os.path.isfile(_default_path):
-            try:
-                _parse_start = time.perf_counter()
-                # Calculate SHA-256 of default dataset
-                with open(_default_path, "rb") as f:
-                    file_bytes = f.read()
-                    file_hash = hashlib.sha256(file_bytes).hexdigest()
-
-                adapter = get_adapter(_default_path)
-                raw_df = adapter.load(_default_path)
-                with st.spinner("🧠 AI Engine running on default dataset..."):
-                    df, features_df = run_ai_on_upload(adapter, raw_df, contamination, start_time=_parse_start)
-                    data_source = "default"
-
-                with st.sidebar:
-                    _p = _get_palette()
-                    st.markdown(
-                        f'<div style="font-size:0.75rem; color:{_p["muted"]}; padding:10px; background:{_p["card"]}; border-radius:4px; margin-bottom:10px; border:1px solid {_p["card_border"]};">'
-                        f'<b>🔒 SHA-256 Source Hash (Default CSV):</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-            except Exception as e:
-                import traceback
-                st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
-                st.stop()
+            with open(_default_path, "rb") as f:
+                file_bytes = f.read()
+            file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+            file_hash = file_sha256
+            mode = os.path.splitext(_default_path)[1].lower() or ".csv"
+            data_source = "default"
         else:
             st.warning("📁 Please upload a CSV or generate synthetic data using the sidebar.")
             st.stop()
-            st.stop()
+
+try:
+    df, features_df, stats = run_full_pipeline(
+        file_bytes, file_sha256, contamination, whitelist_sha, watchlist_sha, mode
+    )
+except Exception as e:
+    import traceback
+    st.error(f"❌ **Error running pipeline:** {e}\n\n```python\n{traceback.format_exc()}\n```")
+    st.stop()
+
+st.session_state["pipeline_elapsed_s"] = stats.get("elapsed_s", 0.0)
+st.session_state["pipeline_tx_count"] = len(df)
+correlation_stats = stats.get("correlation") or stats.get("correlation_stats")
+_ingest_report = stats
+adapter = BitcoinCSVAdapter()
+adapter.last_report = stats
+adapter.WEIGHTS = stats.get("weights")
+
+with st.sidebar:
+    _p = _get_palette()
+    if data_source == "uploaded_separate":
+        _matched = correlation_stats.get('matched', len(df)) if correlation_stats else len(df)
+        st.markdown(
+            f'<div class="upload-banner">'
+            f"✅ Correlated <b>{_matched}</b> txids · "
+            f"<b>{(df['is_anomaly'].sum())}</b> flagged"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    elif data_source == "uploaded":
+        st.markdown(
+            f'<div class="upload-banner">'
+            f"✅ Analysed <b>{stats.get('rows_read', len(df))}</b> transactions · "
+            f"<b>{(df['is_anomaly'].sum())}</b> flagged"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div style="font-size:0.75rem; color:{_p["muted"]}; padding:10px; background:{_p["card"]}; border-radius:4px; margin-bottom:10px; border:1px solid {_p["card_border"]};">'
+            f'<b>🔒 SHA-256 Source Hash:</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    elif data_source == "default_separate":
+        st.markdown(
+            f'<div style="font-size:0.75rem; color:{_p["muted"]}; padding:10px; background:{_p["card"]}; border-radius:4px; margin-bottom:10px; border:1px solid {_p["card_border"]};">'
+            f'<b>🔒 SHA-256 Source Hash (Correlated):</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div style="font-size:0.75rem; color:{_p["muted"]}; padding:10px; background:{_p["card"]}; border-radius:4px; margin-bottom:10px; border:1px solid {_p["card_border"]};">'
+            f'<b>🔒 SHA-256 Source Hash (Default CSV):</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
 # ---------------------------------------------------------------------------
 # Compute metrics
 # ---------------------------------------------------------------------------
@@ -1834,16 +1877,8 @@ with tab1:
 # TAB 2: SUSPICIOUS TRANSACTIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
-with tab2:
-    st.markdown(
-        '<div class="section-title"><span class="icon">🚨</span> Suspicious Transactions — Ranked by Investigative Priority</div>',
-        unsafe_allow_html=True,
-    )
-    _tab_p = _get_palette()
-    st.markdown(f'<p style="color:{_tab_p["muted"]};font-size:0.88rem;margin-bottom:0.2rem;">Highest-risk transactions first, each with its reason.</p>', unsafe_allow_html=True)
-    with st.expander("ℹ️ How to read this"):
-        st.markdown("Each row is one transaction. Investigative Priority % is the AI risk score (higher = more suspicious). Cluster confidence shows how reliable the wallet grouping is: High-Confidence, Mixer-Affected, or Heuristic/Inferred. Use the filters to narrow by attack type or risk range.")
-
+@st.fragment
+def render_suspicious_transactions_section(df: pd.DataFrame, total_tx: int):
     # ── Filters ──
     filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 2, 1.5, 1])
 
@@ -2056,33 +2091,25 @@ with tab2:
         )
 
 
+with tab2:
+    st.markdown(
+        '<div class="section-title"><span class="icon">🚨</span> Suspicious Transactions — Ranked by Investigative Priority</div>',
+        unsafe_allow_html=True,
+    )
+    _tab_p = _get_palette()
+    st.markdown(f'<p style="color:{_tab_p["muted"]};font-size:0.88rem;margin-bottom:0.2rem;">Highest-risk transactions first, each with its reason.</p>', unsafe_allow_html=True)
+    with st.expander("ℹ️ How to read this"):
+        st.markdown("Each row is one transaction. Investigative Priority % is the AI risk score (higher = more suspicious). Cluster confidence shows how reliable the wallet grouping is: High-Confidence, Mixer-Affected, or Heuristic/Inferred. Use the filters to narrow by attack type or risk range.")
+
+    render_suspicious_transactions_section(df, total_tx)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 3: NETWORK GRAPH
 # ═══════════════════════════════════════════════════════════════════════════
 
-with tab3:
-    st.markdown(
-        """
-        <div class="section-title">
-            <span class="icon">🕸️</span> Network Graph
-        </div>
-        <p class="section-subtitle">
-            Fund flow visualization &nbsp;·&nbsp;
-            <span style="color:#ef4444; font-weight:600;">● Red = flagged anomalies</span> &nbsp;·&nbsp;
-            <span style="color:#f59e0b; font-weight:600;">◆ Amber = transactions</span> &nbsp;·&nbsp;
-            <span style="color:#9b59b6; font-weight:600;">■ Purple = wallet entities</span> &nbsp;·&nbsp;
-            <span style="color:#4ade80; font-weight:600;">● Green = regulated</span> &nbsp;·&nbsp;
-            <span style="color:#3b82f6; font-weight:600;">● Blue = context nodes</span> &nbsp;·&nbsp;
-            <span style="color:#ef4444; font-weight:600;">★ = watchlist (known-bad)</span>
-        </p>
-        """,
-        unsafe_allow_html=True,
-    )
-    _tab_p = _get_palette()
-    st.markdown(f'<p style="color:{_tab_p["muted"]};font-size:0.88rem;margin-bottom:0.2rem;">See which wallets, IPs, and transactions are connected.</p>', unsafe_allow_html=True)
-    with st.expander("ℹ️ How to read this"):
-        st.markdown("Nodes are wallets, IP addresses and transactions; lines show how funds and observations connect. Red = flagged anomalies, amber = transactions, purple = wallet entities, green = regulated/whitelisted, blue = context nodes, ★ star = watchlist (known-bad). Pick a target entity to isolate its neighbourhood. Drag, zoom and hover to explore.")
-
+@st.fragment
+def render_network_graph_section(df: pd.DataFrame):
     # ── Graph mode toggle ──
     toggle_col1, toggle_col2 = st.columns([1, 3])
     with toggle_col1:
@@ -2354,36 +2381,38 @@ with tab3:
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+with tab3:
+    st.markdown(
+        """
+        <div class="section-title">
+            <span class="icon">🕸️</span> Network Graph
+        </div>
+        <p class="section-subtitle">
+            Fund flow visualization &nbsp;·&nbsp;
+            <span style="color:#ef4444; font-weight:600;">● Red = flagged anomalies</span> &nbsp;·&nbsp;
+            <span style="color:#f59e0b; font-weight:600;">◆ Amber = transactions</span> &nbsp;·&nbsp;
+            <span style="color:#9b59b6; font-weight:600;">■ Purple = wallet entities</span> &nbsp;·&nbsp;
+            <span style="color:#4ade80; font-weight:600;">● Green = regulated</span> &nbsp;·&nbsp;
+            <span style="color:#3b82f6; font-weight:600;">● Blue = context nodes</span> &nbsp;·&nbsp;
+            <span style="color:#ef4444; font-weight:600;">★ = watchlist (known-bad)</span>
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
+    _tab_p = _get_palette()
+    st.markdown(f'<p style="color:{_tab_p["muted"]};font-size:0.88rem;margin-bottom:0.2rem;">See which wallets, IPs, and transactions are connected.</p>', unsafe_allow_html=True)
+    with st.expander("ℹ️ How to read this"):
+        st.markdown("Nodes are wallets, IP addresses and transactions; lines show how funds and observations connect. Red = flagged anomalies, amber = transactions, purple = wallet entities, green = regulated/whitelisted, blue = context nodes, ★ star = watchlist (known-bad). Pick a target entity to isolate its neighbourhood. Drag, zoom and hover to explore.")
+
+    render_network_graph_section(df)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB 4: WHY FLAGGED?
 # ═══════════════════════════════════════════════════════════════════════════
 
-with tab4:
-    st.markdown(
-        '<div class="section-title"><span class="icon">🔍</span> Why Flagged?</div>'
-        '<p class="section-subtitle">Select any transaction to inspect its dynamic feature percentiles and statistical deviations.</p>',
-        unsafe_allow_html=True,
-    )
-    _tab_p = _get_palette()
-    st.markdown(f'<p style="color:{_tab_p["muted"]};font-size:0.88rem;margin-bottom:0.2rem;">Pick one transaction and see exactly why the AI flagged it.</p>', unsafe_allow_html=True)
-    with st.expander("ℹ️ How to read this"):
-        st.markdown("Select a transaction to see its details and the plain-English reasons it was flagged. The feature table compares each value to the rest of the dataset using percentiles (e.g. '98th percentile' = higher than 98% of transactions). IP/ASN data shows where traffic was observed, not the sender's identity.")
-
-    # Phase 3: network telemetry disclaimer (persistent, visible)
-    st.markdown(
-        """
-        <div style="background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.3);
-                    border-radius: 0.6rem; padding: 0.7rem 1rem; margin-bottom: 0.8rem;">
-            <span style="color: #fbbf24; font-size: 0.78rem; font-weight: 600;">
-                &#9888;&#65039; Network observation correlation &mdash; not absolute identity attribution
-                (Subject to VPN / NAT / Tor limits). IP telemetry identifies observation nodes,
-                NOT sender identities. ASN data resolved offline (no external API).
-            </span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+@st.fragment
+def render_why_flagged_section(df: pd.DataFrame, features_df: pd.DataFrame, file_hash: str):
     # ── Transaction selector ──
     sorted_df = df.sort_values("risk_score", ascending=False)
     tx_options = [
@@ -3132,6 +3161,35 @@ with tab4:
             """,
             unsafe_allow_html=True,
         )
+
+
+with tab4:
+    st.markdown(
+        '<div class="section-title"><span class="icon">🔍</span> Why Flagged?</div>'
+        '<p class="section-subtitle">Select any transaction to inspect its dynamic feature percentiles and statistical deviations.</p>',
+        unsafe_allow_html=True,
+    )
+    _tab_p = _get_palette()
+    st.markdown(f'<p style="color:{_tab_p["muted"]};font-size:0.88rem;margin-bottom:0.2rem;">Pick one transaction and see exactly why the AI flagged it.</p>', unsafe_allow_html=True)
+    with st.expander("ℹ️ How to read this"):
+        st.markdown("Select a transaction to see its details and the plain-English reasons it was flagged. The feature table compares each value to the rest of the dataset using percentiles (e.g. '98th percentile' = higher than 98% of transactions). IP/ASN data shows where traffic was observed, not the sender's identity.")
+
+    # Phase 3: network telemetry disclaimer (persistent, visible)
+    st.markdown(
+        """
+        <div style="background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.3);
+                    border-radius: 0.6rem; padding: 0.7rem 1rem; margin-bottom: 0.8rem;">
+            <span style="color: #fbbf24; font-size: 0.78rem; font-weight: 600;">
+                &#9888;&#65039; Network observation correlation &mdash; not absolute identity attribution
+                (Subject to VPN / NAT / Tor limits). IP telemetry identifies observation nodes,
+                NOT sender identities. ASN data resolved offline (no external API).
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    render_why_flagged_section(df, features_df, file_hash)
 
 
 
