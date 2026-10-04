@@ -131,6 +131,16 @@ PROFILED_FEATURES = {
         "direction": "high",
         "heuristic": "dst_port_anomaly",
     },
+    "ip_observation_count": {
+        "label": "Telemetry observation count",
+        "direction": "high",
+        "heuristic": "relay_propagation",
+    },
+    "observation_spread_s": {
+        "label": "Telemetry observation spread (s)",
+        "direction": "high",
+        "heuristic": "observation_delay_spread",
+    },
 }
 
 # Known Tor/proxy/I2P port numbers for direct signal detection
@@ -371,6 +381,14 @@ def _detect_direct_signals(
             f"Multi-hop peel chain trajectory ({chain_len} linked hops)"
         )
 
+    # ── 9. Multi-relay telemetry observation anomaly ─────────────────
+    obs_count = int(row_features.get("ip_observation_count", original_row.get("ip_observation_count", 1)))
+    spread_s = float(row_features.get("observation_spread_s", original_row.get("observation_spread_s", 0.0)))
+    if obs_count >= 3 and spread_s >= 10.0:
+        signals.append(
+            f"Multi-relay telemetry anomaly: observed by {obs_count} distinct relays across {spread_s:.1f}s propagation window"
+        )
+
     return signals
 
 
@@ -486,6 +504,8 @@ def _format_deviation_reason(
         "fee_scaled":            " — fee deviates from typical range",
         "src_port_risk":         " — source port associated with anonymization",
         "dst_port_risk":         " — destination port associated with hidden services",
+        "ip_observation_count":   " — multi-relay observation profile",
+        "observation_spread_s":   " — wide temporal spread across relay observations",
     }
 
     if feat_name in _INTERPRETATIONS:
@@ -496,8 +516,10 @@ def _format_deviation_reason(
 
 def _format_value(value: float, feat_name: str) -> str:
     """Format a numeric value for human display."""
-    if feat_name in ("fan_in", "fan_out", "peel_chain_length"):
+    if feat_name in ("fan_in", "fan_out", "peel_chain_length", "ip_observation_count"):
         return str(int(value))
+    elif feat_name == "observation_spread_s":
+        return f"{value:.2f}s"
     elif feat_name in ("fee_rate_urgency", "peel_chain_disparity", "fund_diminishment_ratio"):
         return f"{value:.6f}"
     else:
@@ -608,6 +630,10 @@ def generate_telemetry(
         if feat_name == "peel_chain_disparity" and observed > 0 and observed > stats.median:
             is_flagged = True
         if feat_name == "peel_chain_length" and observed >= 2:
+            is_flagged = True
+        if feat_name == "ip_observation_count" and observed >= 2 and observed > stats.median:
+            is_flagged = True
+        if feat_name == "observation_spread_s" and observed > 0 and observed > stats.median:
             is_flagged = True
 
         if not is_flagged:

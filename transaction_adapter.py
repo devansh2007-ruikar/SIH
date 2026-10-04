@@ -408,6 +408,10 @@ def _normalise_dataframe(df: pd.DataFrame, adapter_name: str) -> pd.DataFrame:
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
+    # ── geo_country (default to 'XX', will be resolved by geo_asn) 
+    if "geo_country" not in df.columns:
+        df["geo_country"] = "XX"
+
     return df
 
 
@@ -710,8 +714,12 @@ class BaseTransactionAdapter(ABC):
         # 2. Normalise addresses
         df = self.normalize_addresses(df)
 
+        # Ensure geo_country is present (defaults to 'XX', enriched later by geo_asn)
+        if "geo_country" not in df.columns:
+            df["geo_country"] = "XX"
+
         # 3. Validate required columns
-        missing = [c for c in self.REQUIRED_COLUMNS if c not in df.columns]
+        missing = [c for c in self.REQUIRED_COLUMNS if c != "geo_country" and c not in df.columns]
         if missing:
             raise ValueError(
                 f"[{self.CHAIN_NAME}] Missing required columns after "
@@ -834,7 +842,6 @@ class BitcoinCSVAdapter(BaseTransactionAdapter):
         "timestamp", "src_ip", "dst_ip", "src_port", "dst_port",
         "txid", "input_addresses", "output_addresses",
         "input_amounts", "output_amounts", "fee", "script_type",
-        "geo_country",
     ]
 
     def load(self, filepath: str) -> pd.DataFrame:
@@ -1006,7 +1013,6 @@ class BitcoinJSONAdapter(BaseTransactionAdapter):
         "timestamp", "src_ip", "dst_ip", "src_port", "dst_port",
         "txid", "input_addresses", "output_addresses",
         "input_amounts", "output_amounts", "fee", "script_type",
-        "geo_country",
     ]
 
     def load(self, filepath: str) -> pd.DataFrame:
@@ -1246,7 +1252,6 @@ class BitcoinXMLAdapter(BaseTransactionAdapter):
         "timestamp", "src_ip", "dst_ip", "src_port", "dst_port",
         "txid", "input_addresses", "output_addresses",
         "input_amounts", "output_amounts", "fee", "script_type",
-        "geo_country",
     ]
 
     def load(self, filepath: str) -> pd.DataFrame:
@@ -1577,3 +1582,131 @@ def get_adapter(
         "BitcoinCSVAdapter."
     )
     return BitcoinCSVAdapter()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MULTI-LAYER CORRELATION: Network Telemetry × Blockchain
+# ═══════════════════════════════════════════════════════════════════════════
+
+def correlate_layers(
+    net_df: pd.DataFrame,
+    chain_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Join separate network-telemetry and blockchain DataFrames on ``txid``.
+
+    Parameters
+    ----------
+    net_df : pd.DataFrame
+        Network telemetry layer with columns:
+        ``timestamp, src_ip, dst_ip, src_port, dst_port, txid``.
+    chain_df : pd.DataFrame
+        Blockchain layer with columns:
+        ``txid, timestamp, input_addresses, output_addresses,
+        input_amounts, output_amounts, fee, script_type``.
+
+    Returns
+    -------
+    merged_df : pd.DataFrame
+        One row per txid with all blockchain columns plus:
+        * ``src_ip`` — the IP with the earliest telemetry timestamp
+          (``first_seen_ip``)
+        * ``dst_ip`` — destination IP from the earliest observation
+        * ``src_port`` / ``dst_port`` — ports from the earliest observation
+        * ``ip_observation_count`` — number of telemetry rows for that txid
+        * ``observation_spread_s`` — (latest − earliest) telemetry timestamp
+          in seconds
+    stats : dict
+        Correlation statistics:
+        ``matched``, ``telemetry_only``, ``chain_only``, ``match_rate``.
+    """
+    # Ensure timestamps are datetime
+    net = net_df.copy()
+    chain = chain_df.copy()
+
+    if "timestamp" in net.columns:
+        net["timestamp"] = pd.to_datetime(net["timestamp"], errors="coerce")
+    if "timestamp" in chain.columns:
+        chain["timestamp"] = pd.to_datetime(chain["timestamp"], errors="coerce")
+
+    # ── Compute per-txid telemetry aggregates ──
+    net_sorted = net.sort_values("timestamp")
+
+    # First-seen observation per txid (earliest timestamp row)
+    first_obs = net_sorted.drop_duplicates(subset="txid", keep="first")
+    first_obs = first_obs.rename(columns={
+        "src_ip": "first_seen_ip",
+        "dst_ip": "_first_dst_ip",
+        "src_port": "_first_src_port",
+        "dst_port": "_first_dst_port",
+        "timestamp": "_first_ts",
+    })
+
+    # Observation count and spread per txid
+    net_agg = net_sorted.groupby("txid").agg(
+        ip_observation_count=("src_ip", "count"),
+        _last_ts=("timestamp", "max"),
+        _first_ts_agg=("timestamp", "min"),
+    ).reset_index()
+
+    net_agg["observation_spread_s"] = (
+        (net_agg["_last_ts"] - net_agg["_first_ts_agg"])
+        .dt.total_seconds()
+        .fillna(0.0)
+        .round(2)
+    )
+    net_agg.drop(columns=["_last_ts", "_first_ts_agg"], inplace=True)
+
+    # Merge first-obs + agg onto chain
+    enrich = first_obs[["txid", "first_seen_ip", "_first_dst_ip",
+                         "_first_src_port", "_first_dst_port"]].merge(
+        net_agg, on="txid", how="outer",
+    )
+
+    # ── Join with blockchain layer ──
+    all_chain_txids = set(chain["txid"].dropna().unique())
+    all_net_txids = set(enrich["txid"].dropna().unique())
+
+    matched = all_chain_txids & all_net_txids
+    telemetry_only = all_net_txids - all_chain_txids
+    chain_only = all_chain_txids - all_net_txids
+    total = len(all_chain_txids | all_net_txids) or 1
+    match_rate = round(len(matched) / total, 4)
+
+    stats = {
+        "matched": len(matched),
+        "telemetry_only": len(telemetry_only),
+        "chain_only": len(chain_only),
+        "match_rate": match_rate,
+    }
+
+    merged = chain.merge(enrich, on="txid", how="left")
+
+    # Use first_seen_ip as the canonical src_ip
+    merged["src_ip"] = merged["first_seen_ip"].fillna("")
+    merged["dst_ip"] = merged["_first_dst_ip"].fillna("")
+    merged["src_port"] = merged["_first_src_port"].fillna(8333).astype(int)
+    merged["dst_port"] = merged["_first_dst_port"].fillna(8333).astype(int)
+
+    # Default observation columns for chain-only txids
+    merged["ip_observation_count"] = merged["ip_observation_count"].fillna(0).astype(int)
+    merged["observation_spread_s"] = merged["observation_spread_s"].fillna(0.0)
+
+    # Ensure geo_country exists (preserve from chain if present, else default 'XX')
+    if "geo_country" in chain.columns:
+        merged["geo_country"] = chain["geo_country"].fillna("XX")
+    elif "geo_country" not in merged.columns:
+        merged["geo_country"] = "XX"
+
+    # Clean up temp columns
+    _temp_cols = ["first_seen_ip", "_first_dst_ip", "_first_src_port", "_first_dst_port"]
+    merged.drop(columns=[c for c in _temp_cols if c in merged.columns],
+                inplace=True)
+
+    logger.info(
+        "correlate_layers: matched=%d, telemetry_only=%d, chain_only=%d, rate=%.2f%%",
+        stats["matched"], stats["telemetry_only"],
+        stats["chain_only"], stats["match_rate"] * 100,
+    )
+
+    return merged, stats

@@ -60,6 +60,10 @@ OUTPUT_JSON = "synthetic_transactions_sample.json"
 OUTPUT_XML = "synthetic_transactions_sample.xml"
 WHITELIST_CSV = "institutional_whitelist.csv"
 
+# Split-mode output paths
+NETWORK_TELEMETRY_CSV = os.path.join("sample_data", "network_telemetry.csv")
+BLOCKCHAIN_TX_CSV = os.path.join("sample_data", "blockchain_tx.csv")
+
 # Multi-hop peel chain depth bounds
 PEEL_CHAIN_DEPTH_MIN = 3
 PEEL_CHAIN_DEPTH_MAX = 5
@@ -660,6 +664,77 @@ def generate_watchlist_csv(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# Split-Mode File Generation
+# ---------------------------------------------------------------------------
+
+def generate_split_files(df: pd.DataFrame):
+    """
+    Split the unified transaction DataFrame into two separate files
+    for multi-layer correlation testing:
+
+    - ``sample_data/network_telemetry.csv`` — network observation layer
+      (timestamp, src_ip, dst_ip, src_port, dst_port, txid)
+    - ``sample_data/blockchain_tx.csv`` — on-chain layer
+      (txid, timestamp, input_addresses, output_addresses,
+       input_amounts, output_amounts, fee, script_type)
+
+    For realism, 20% of txids receive 1–3 *extra* telemetry observations
+    with different relay IPs and timestamps shifted +1 to +30 seconds
+    from the original, simulating multiple relay nodes observing the
+    same broadcast.
+    """
+    os.makedirs("sample_data", exist_ok=True)
+
+    # ── Blockchain layer (one row per txid) ──
+    chain_cols = [
+        "txid", "timestamp", "input_addresses", "output_addresses",
+        "input_amounts", "output_amounts", "fee", "script_type",
+    ]
+    chain_df = df[[c for c in chain_cols if c in df.columns]].copy()
+    chain_df.to_csv(BLOCKCHAIN_TX_CSV, index=False)
+    print(f"[*] Generated {BLOCKCHAIN_TX_CSV} with {len(chain_df)} on-chain txs.")
+
+    # ── Network telemetry layer ──
+    net_cols = ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "txid"]
+    net_rows = []
+    for _, row in df.iterrows():
+        # Primary observation (the original row)
+        net_rows.append({
+            "timestamp": row["timestamp"],
+            "src_ip": row.get("src_ip", fake.ipv4_public()),
+            "dst_ip": row.get("dst_ip", fake.ipv4_public()),
+            "src_port": row.get("src_port", random.choice(STANDARD_PORTS)),
+            "dst_port": row.get("dst_port", random.choice(STANDARD_PORTS)),
+            "txid": row["txid"],
+        })
+
+        # 20% chance of 1–3 extra relay observations for realism
+        if random.random() < 0.20:
+            extra_count = random.randint(1, 3)
+            base_ts = pd.to_datetime(row["timestamp"])
+            for _ in range(extra_count):
+                offset_s = random.randint(1, 30)
+                relay_ts = base_ts + timedelta(seconds=offset_s)
+                net_rows.append({
+                    "timestamp": relay_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    "src_ip": fake.ipv4_public(),  # different relay IP
+                    "dst_ip": row.get("dst_ip", fake.ipv4_public()),
+                    "src_port": random.choice(STANDARD_PORTS + PROXY_PORTS),
+                    "dst_port": row.get("dst_port", random.choice(STANDARD_PORTS)),
+                    "txid": row["txid"],
+                })
+
+    net_df = pd.DataFrame(net_rows)
+    net_df.sort_values("timestamp", inplace=True)
+    net_df.reset_index(drop=True, inplace=True)
+    net_df.to_csv(NETWORK_TELEMETRY_CSV, index=False)
+    print(
+        f"[*] Generated {NETWORK_TELEMETRY_CSV} with {len(net_df)} "
+        f"telemetry observations ({len(net_df) - len(df)} extra relay obs)."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pipeline Execution
 # ---------------------------------------------------------------------------
 def generate_transactions_df(
@@ -730,6 +805,7 @@ def main(
     peel_depth_max: int = PEEL_CHAIN_DEPTH_MAX,
     output_csv: str = OUTPUT_CSV,
     terminal_to_exchange: bool = True,
+    split: bool = False,
 ):
     print(f"[*] Initializing Synthetic Data Generator (Records: {total_records})")
     print(f"    Peel chain depth: {peel_depth_min}–{peel_depth_max} hops")
@@ -748,9 +824,12 @@ def main(
 
     df.to_csv(output_csv, index=False)
 
+    peel_chains_count = df["chain_id"].dropna().nunique() if "chain_id" in df.columns else 0
+    suspicious_count = int(df["is_labeled_suspicious"].sum()) if "is_labeled_suspicious" in df.columns else 0
+
     print(f"\n[*] Generated {len(df)} transactions → Saved to '{output_csv}'.")
-    print(f"[*] Peel chains: {peel_chains_generated} chains")
-    print(f"[*] Threat Vectors injected: {suspicious_generated} ({suspicious_ratio*100:.1f}% target)")
+    print(f"[*] Peel chains: {peel_chains_count} chains")
+    print(f"[*] Threat Vectors injected: {suspicious_count} ({suspicious_ratio*100:.1f}% target)")
 
     breakdown = df["attack_type"].value_counts()
     print("\n--- Breakdown ---")
@@ -776,6 +855,10 @@ def main(
     # 5. Generate demo threat-intel watchlist (known-bad indicators)
     generate_watchlist_csv(df)
 
+    # 6. (Optional) Split into separate network-telemetry & blockchain files
+    if split:
+        generate_split_files(df)
+
     print(f"\n-----------------\n[✓] Done.")
 
 
@@ -793,6 +876,9 @@ if __name__ == "__main__":
                         help=f"Output CSV path (default: {OUTPUT_CSV})")
     parser.add_argument("--no-terminal-exchange", action="store_true",
                         help="Don't route final hop to institutional exchange")
+    parser.add_argument("--split", action="store_true",
+                        help="Also write sample_data/network_telemetry.csv and "
+                             "sample_data/blockchain_tx.csv for multi-layer correlation testing")
     args = parser.parse_args()
     main(
         total_records=args.total_records,
@@ -801,4 +887,5 @@ if __name__ == "__main__":
         peel_depth_max=args.peel_depth_max,
         output_csv=args.output,
         terminal_to_exchange=not args.no_terminal_exchange,
+        split=args.split,
     )

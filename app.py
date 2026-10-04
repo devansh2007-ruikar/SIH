@@ -20,10 +20,13 @@ import tempfile
 import os
 import json
 import socket
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from io import StringIO
 from typing import Optional
+
+import dossier
 
 import pandas as pd
 # pyrefly: ignore [missing-import]
@@ -605,16 +608,48 @@ with st.sidebar:
     # ── Section 1: Data Source ──
     st.markdown("##### 📂 Data Source")
 
-    uploaded_file = st.file_uploader(
-        "Upload Transaction Data",
-        type=["csv", "json", "xml"],
-        help="Upload raw transactions. The appropriate adapter will be automatically selected based on file extension.",
-        key="data_upload",
+    upload_mode = st.radio(
+        "Upload mode",
+        ["Single merged file", "Separate network + blockchain files"],
+        index=0,
+        key="upload_mode",
+        help="Choose whether to upload a single pre-merged transaction file or separate network-telemetry and blockchain CSV files that will be correlated on txid.",
     )
-    if uploaded_file:
-        st.info(f"✅ Currently using: **{uploaded_file.name}**")
+
+    uploaded_file = None
+    uploaded_net_file = None
+    uploaded_chain_file = None
+
+    if upload_mode == "Single merged file":
+        uploaded_file = st.file_uploader(
+            "Upload Transaction Data",
+            type=["csv", "json", "xml"],
+            help="Upload raw transactions. The appropriate adapter will be automatically selected based on file extension.",
+            key="data_upload",
+        )
+        if uploaded_file:
+            st.info(f"✅ Currently using: **{uploaded_file.name}**")
+        else:
+            st.info("📄 Currently using default: **synthetic_transactions.csv**")
     else:
-        st.info("📄 Currently using default: **synthetic_transactions.csv**")
+        uploaded_net_file = st.file_uploader(
+            "Upload Network Telemetry CSV",
+            type=["csv"],
+            help="CSV with columns: timestamp, src_ip, dst_ip, src_port, dst_port, txid",
+            key="net_upload",
+        )
+        uploaded_chain_file = st.file_uploader(
+            "Upload Blockchain Transactions CSV",
+            type=["csv"],
+            help="CSV with columns: txid, timestamp, input_addresses, output_addresses, input_amounts, output_amounts, fee, script_type",
+            key="chain_upload",
+        )
+        if uploaded_net_file and uploaded_chain_file:
+            st.info(f"✅ Net: **{uploaded_net_file.name}** · Chain: **{uploaded_chain_file.name}**")
+        elif uploaded_net_file or uploaded_chain_file:
+            st.warning("⚠️ Upload both files for correlation.")
+        else:
+            st.info("📄 Using defaults: **sample_data/network_telemetry.csv** + **sample_data/blockchain_tx.csv**")
 
     uploaded_whitelist = st.file_uploader(
         "Upload Custom Whitelist CSV",
@@ -769,6 +804,11 @@ if uploaded_watchlist is not None:
 
 def run_ai_on_upload(adapter, raw_df: pd.DataFrame, cont: float):
     """Run the full AI pipeline via the polymorphic adapter, then enrich with offline Geo-ASN."""
+    if "geo_country" not in raw_df.columns:
+        raw_df["geo_country"] = "XX"
+    if hasattr(adapter, "REQUIRED_COLUMNS"):
+        adapter.REQUIRED_COLUMNS = [c for c in adapter.REQUIRED_COLUMNS if c != "geo_country"]
+
     enriched_df, _model, features = adapter.run_pipeline_from_df(
         raw_df, contamination=cont,
     )
@@ -794,8 +834,77 @@ import hashlib
 # Determine data source and load
 file_hash = "N/A"
 ingest_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+correlation_stats = None   # Populated only in separate-file mode
+_default_path = DEFAULT_DATASET if os.path.isfile(DEFAULT_DATASET) else _FALLBACK_DATASET
 
-if uploaded_file is not None:
+# ── Helper: load separate files and correlate ──
+def _load_separate_files(net_source, chain_source, is_upload=False):
+    """Load network + blockchain CSVs, correlate on txid, and return (merged_df, adapter, hash, corr_stats)."""
+    import importlib
+    import transaction_adapter
+    importlib.reload(transaction_adapter)
+    from transaction_adapter import BitcoinCSVAdapter, correlate_layers as _correlate
+
+    if is_upload:
+        net_bytes = net_source.getvalue()
+        chain_bytes = chain_source.getvalue()
+        combined_hash = hashlib.sha256(net_bytes + chain_bytes).hexdigest()
+        net_df = pd.read_csv(io.BytesIO(net_bytes))
+        chain_df = pd.read_csv(io.BytesIO(chain_bytes))
+    else:
+        with open(net_source, "rb") as f1, open(chain_source, "rb") as f2:
+            b1, b2 = f1.read(), f2.read()
+        combined_hash = hashlib.sha256(b1 + b2).hexdigest()
+        net_df = pd.read_csv(net_source)
+        chain_df = pd.read_csv(chain_source)
+
+    merged, corr_stats = _correlate(net_df, chain_df)
+    if "geo_country" not in merged.columns:
+        merged["geo_country"] = "XX"
+
+    adapter = BitcoinCSVAdapter()
+    if hasattr(adapter, "REQUIRED_COLUMNS"):
+        adapter.REQUIRED_COLUMNS = [c for c in adapter.REQUIRED_COLUMNS if c != "geo_country"]
+
+    # Run validation/report on the merged result
+    merged = adapter._validate_and_build_report(merged, source=None, fmt="CSV (correlated)")
+    if "geo_country" not in merged.columns:
+        merged["geo_country"] = "XX"
+
+    adapter.last_report["sha256"] = combined_hash
+    adapter.last_report["correlation"] = corr_stats
+    return merged, adapter, combined_hash, corr_stats
+
+
+if upload_mode == "Separate network + blockchain files" and (uploaded_net_file or uploaded_chain_file):
+    # ── Separate-file mode ──
+    if uploaded_net_file and uploaded_chain_file:
+        try:
+            raw_df, adapter, file_hash, correlation_stats = _load_separate_files(
+                uploaded_net_file, uploaded_chain_file, is_upload=True,
+            )
+            with st.spinner("🧠 AI Engine running — detecting anomalies (correlated mode)..."):
+                df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
+                data_source = "uploaded_separate"
+
+            with st.sidebar:
+                _p = _get_palette()
+                st.markdown(
+                    f'<div class="upload-banner">'
+                    f"✅ Correlated <b>{correlation_stats['matched']}</b> txids · "
+                    f"<b>{(df['is_anomaly'].sum())}</b> flagged"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+        except Exception as e:
+            import traceback
+            st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
+            st.stop()
+    else:
+        st.warning("⚠️ Please upload **both** the network telemetry and blockchain files.")
+        st.stop()
+
+elif uploaded_file is not None:
     try:
         # Calculate SHA-256 of uploaded file for data provenance
         file_bytes = uploaded_file.getvalue()
@@ -837,26 +946,25 @@ if uploaded_file is not None:
         st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
         st.stop()
 else:
-    # Determine default dataset: prefer synthetic_transactions.csv, fall back to bitcoin_traffic.csv
-    _default_path = DEFAULT_DATASET if os.path.isfile(DEFAULT_DATASET) else _FALLBACK_DATASET
-    if os.path.isfile(_default_path):
-        try:
-            # Calculate SHA-256 of default dataset
-            with open(_default_path, "rb") as f:
-                file_bytes = f.read()
-                file_hash = hashlib.sha256(file_bytes).hexdigest()
+    # ── Default dataset loading ──
+    # In separate mode without uploads, try the split files first
+    _NET_DEFAULT = os.path.join("sample_data", "network_telemetry.csv")
+    _CHAIN_DEFAULT = os.path.join("sample_data", "blockchain_tx.csv")
 
-            adapter = get_adapter(_default_path)
-            raw_df = adapter.load(_default_path)
-            with st.spinner("🧠 AI Engine running on default dataset..."):
+    if upload_mode == "Separate network + blockchain files" and os.path.isfile(_NET_DEFAULT) and os.path.isfile(_CHAIN_DEFAULT):
+        try:
+            raw_df, adapter, file_hash, correlation_stats = _load_separate_files(
+                _NET_DEFAULT, _CHAIN_DEFAULT, is_upload=False,
+            )
+            with st.spinner("🧠 AI Engine running on default split dataset (correlated)..."):
                 df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
-                data_source = "default"
+                data_source = "default_separate"
 
             with st.sidebar:
                 _p = _get_palette()
                 st.markdown(
                     f'<div style="font-size:0.75rem; color:{_p["muted"]}; padding:10px; background:{_p["card"]}; border-radius:4px; margin-bottom:10px; border:1px solid {_p["card_border"]};">'
-                    f'<b>🔒 SHA-256 Source Hash (Default CSV):</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
+                    f'<b>🔒 SHA-256 Source Hash (Correlated):</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
@@ -865,9 +973,37 @@ else:
             st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
             st.stop()
     else:
-        st.warning("📁 Please upload a CSV or generate synthetic data using the sidebar.")
-        st.stop()
-        st.stop()
+        # Standard single-file default path
+        _default_path = DEFAULT_DATASET if os.path.isfile(DEFAULT_DATASET) else _FALLBACK_DATASET
+        if os.path.isfile(_default_path):
+            try:
+                # Calculate SHA-256 of default dataset
+                with open(_default_path, "rb") as f:
+                    file_bytes = f.read()
+                    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+                adapter = get_adapter(_default_path)
+                raw_df = adapter.load(_default_path)
+                with st.spinner("🧠 AI Engine running on default dataset..."):
+                    df, features_df = run_ai_on_upload(adapter, raw_df, contamination)
+                    data_source = "default"
+
+                with st.sidebar:
+                    _p = _get_palette()
+                    st.markdown(
+                        f'<div style="font-size:0.75rem; color:{_p["muted"]}; padding:10px; background:{_p["card"]}; border-radius:4px; margin-bottom:10px; border:1px solid {_p["card_border"]};">'
+                        f'<b>🔒 SHA-256 Source Hash (Default CSV):</b><br/><code>{file_hash[:16]}...{file_hash[-16:]}</code>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+            except Exception as e:
+                import traceback
+                st.error(f"❌ **Error:** {e}\n\n```python\n{traceback.format_exc()}\n```")
+                st.stop()
+        else:
+            st.warning("📁 Please upload a CSV or generate synthetic data using the sidebar.")
+            st.stop()
+            st.stop()
 # ---------------------------------------------------------------------------
 # Compute metrics
 # ---------------------------------------------------------------------------
@@ -937,12 +1073,18 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-source_label = (
-    f"📂 Live analysis of uploaded file ({total_tx} tx)"
-    if data_source == "uploaded"
-    else f"💾 Default dataset: {_default_path} ({total_tx} tx)"
-)
-source_color = "#22c55e" if data_source == "uploaded" else "#3b82f6"
+if data_source == "uploaded_separate":
+    source_label = f"📂 Live analysis of uploaded separate files (telemetry + blockchain) ({total_tx} tx)"
+    source_color = "#22c55e"
+elif data_source == "uploaded":
+    source_label = f"📂 Live analysis of uploaded file ({total_tx} tx)"
+    source_color = "#22c55e"
+elif data_source == "default_separate":
+    source_label = f"💾 Default correlated dataset: network_telemetry.csv + blockchain_tx.csv ({total_tx} tx)"
+    source_color = "#3b82f6"
+else:
+    source_label = f"💾 Default dataset: {_default_path} ({total_tx} tx)"
+    source_color = "#3b82f6"
 
 st.markdown(
     f'<p style="text-align:center; color:{source_color}; font-size:0.78rem; '
@@ -980,6 +1122,22 @@ with st.expander("🧾 Ingestion Report", expanded=False):
         f'</div>',
         unsafe_allow_html=True,
     )
+
+    # Cross-layer correlation metrics (when in separate upload / correlated mode)
+    _corr = correlation_stats or _ingest_report.get("correlation")
+    if _corr:
+        _ingest_report["correlation"] = _corr
+        st.markdown(
+            f'<div style="margin-top:12px; margin-bottom:6px; font-weight:700; font-size:0.85rem; color:{_hp["text"]};">'
+            f'🔗 Cross-Layer Correlation (Network Telemetry × Blockchain)'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        c_col1, c_col2, c_col3, c_col4 = st.columns(4)
+        c_col1.metric("Matched txids", f"{_corr.get('matched', 0):,}")
+        c_col2.metric("Match Rate", f"{_corr.get('match_rate', 0.0) * 100:.1f}%")
+        c_col3.metric("Telemetry Only", f"{_corr.get('telemetry_only', 0):,}")
+        c_col4.metric("Blockchain Only", f"{_corr.get('chain_only', 0):,}")
 
     # Reasons table
     _reasons = _ingest_report.get("reject_reasons", {})
@@ -1172,79 +1330,238 @@ with tab1:
         else:
             st.info("No data to display.")
 
-    # ── Export buttons ──
+    # ── Export buttons & Evidence Dossier ──
     st.markdown('<div class="fancy-divider"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-title"><span class="icon">📑</span> Evidence Dossier & Forensic Case Export</div>',
+        unsafe_allow_html=True,
+    )
+    _cp = _get_palette()
+    st.markdown(
+        f'<p style="color:{_cp["muted"]};font-size:0.88rem;margin-bottom:0.75rem;">'
+        'Generate court-ready, multi-page evidentiary dossiers with multi-signal score decompositions, '
+        'hop-by-hop fund traces, cryptographic provenance hashes, and methodology limitations.'
+        '</p>',
+        unsafe_allow_html=True,
+    )
 
-    exp_col1, exp_col2 = st.columns(2)
+    # UI Controls: Lead Forensic Analyst & Case Reference
+    if "case_id" not in st.session_state:
+        st.session_state["case_id"] = f"MITHYA-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    case_id = st.session_state["case_id"]
 
-    with exp_col1:
-        csv_export = df.to_csv(index=False).encode("utf-8")
+    dossier_col1, dossier_col2 = st.columns([1.5, 2.5])
+    with dossier_col1:
+        analyst_name = st.text_input(
+            "Lead Forensic Analyst",
+            value="Analyst",
+            key="dossier_analyst_name",
+            help="Name or badge number to appear on the official dossier cover page and signature block.",
+        )
+    with dossier_col2:
+        st.text_input(
+            "Active Case Identification",
+            value=case_id,
+            disabled=True,
+            help="Unique evidence tracking identifier (MITHYA-YYYYMMDD-HHMMSS).",
+        )
+
+    # 1. Existing TXT Forensic Report
+    import platform
+    report_lines = [
+        "=" * 70,
+        "  MITHYA — Crypto Forensic Triage Report",
+        f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Engine: IsolationForest (n_estimators=200, contamination={contamination})",
+        "=" * 70,
+        "",
+        "  DATA PROVENANCE & CONFIGURATION",
+        "  -------------------------------",
+        f"  Ingestion Time:   {ingest_time}",
+        f"  Source File Hash: {file_hash} (SHA-256)",
+        f"  Model Version:    v1.4.0 (Graph-Aware Anomaly Detection)",
+        f"  System Config:    {platform.platform()} / Python {platform.python_version()}",
+        "",
+        "  ANALYSIS SUMMARY",
+        "  ----------------",
+        f"  Total Transactions Analysed:  {total_tx:,}",
+        f"  Institutional Transfers Cleared: {whitelisted_count}",
+        f"  ML Anomalies Flagged:        {total_flagged}",
+        f"  CoinJoin Mixers Detected:    {mixer_count}",
+        f"  Peel Chains Detected:        {peel_count}",
+        f"  Fan-Out Dispersals:          {fanout_count}",
+        f"  Fee-Spike Urgency Hops:      {feespike_count}",
+        f"  Max Investigative Priority Index: {max_risk:.1f}%",
+        "",
+        "-" * 70,
+        "  FLAGGED TRANSACTIONS",
+        "-" * 70,
+        "",
+    ]
+
+    if total_flagged > 0:
+        for _, row in flagged_df.sort_values("risk_score", ascending=False).iterrows():
+            report_lines.append(f"  TXID: {row['txid']}")
+            report_lines.append(f"  Priority: {row['risk_score']:.1f}%  |  Entity: {row.get('entity_id', 'N/A')}")
+            report_lines.append(f"  Source IP: {row['src_ip']}  |  Port: {row['src_port']}")
+            report_lines.append(f"  Amount: {row.get('total_amount_btc', 'N/A')} BTC  |  Fee: {row['fee']}")
+            report_lines.append(f"  Geo: {_display_geo(row.get('geo_country'), 'geo')}  |  ASN: {_display_geo(row.get('asn'), 'asn')}")
+            report_lines.append(f"  {row['explanation']}")
+            report_lines.append("")
+    else:
+        report_lines.append("  No anomalies detected.")
+
+    report_lines.append("=" * 70)
+    report_lines.append("  END OF REPORT")
+    report_lines.append("=" * 70)
+    report_text = "\n".join(report_lines)
+
+    # 2. Build Metadata for PDF and JSON Dossiers
+    def _safe_sha256(filepath: str) -> str:
+        if os.path.isfile(filepath):
+            try:
+                with open(filepath, "rb") as _f:
+                    return hashlib.sha256(_f.read()).hexdigest()
+            except Exception:
+                pass
+        return "N/A"
+
+    wl_sha = _safe_sha256("institutional_whitelist.csv")
+    if wl_sha == "N/A":
+        wl_sha = _safe_sha256("sample_data/institutional_whitelist.csv")
+
+    wt_sha = _safe_sha256("sample_data/watchlist.csv")
+    if wt_sha == "N/A":
+        wt_sha = _safe_sha256("watchlist.csv")
+
+    rf_hash = "N/A"
+    if os.path.isfile("models/rf_model.sha256"):
+        try:
+            with open("models/rf_model.sha256", "r") as _rf_f:
+                rf_hash = _rf_f.read().strip()
+        except Exception:
+            pass
+    if rf_hash == "N/A" and os.path.isfile("models/rf_model.joblib"):
+        rf_hash = _safe_sha256("models/rf_model.joblib")
+
+    # Dynamic fusion weights and thresholds
+    weights = getattr(adapter, "WEIGHTS", None)
+    if not isinstance(weights, dict):
+        from anomaly_engine import WEIGHTS as DEFAULT_WEIGHTS
+        weights = DEFAULT_WEIGHTS
+
+    detector_thresholds = {
+        "CoinJoin Min Inputs": "3 inputs",
+        "Fan-Out Min Dispersal": "5 outputs",
+        "Peel Disparity Ratio": "0.70",
+        "Port Risk Threshold": "40.0 pts",
+    }
+
+    funnel_numbers = {
+        "total_ingested": total_tx,
+        "whitelisted_cleared": whitelisted_count,
+        "flagged_anomalies": total_flagged,
+        "mixers_detected": mixer_count,
+        "peel_chains_detected": peel_count,
+        "fanouts_detected": fanout_count,
+        "feespikes_detected": feespike_count,
+    }
+
+    tier_counts = {
+        "Critical": int((df["risk_tier"] == "Critical").sum()) if "risk_tier" in df.columns else 0,
+        "High": int((df["risk_tier"] == "High").sum()) if "risk_tier" in df.columns else 0,
+        "Medium": int((df["risk_tier"] == "Medium").sum()) if "risk_tier" in df.columns else 0,
+        "Low": int((df["risk_tier"] == "Low").sum()) if "risk_tier" in df.columns else 0,
+    }
+
+    dossier_meta = {
+        "case_id": case_id,
+        "analyst_name": analyst_name.strip() or "Analyst",
+        "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source_file_sha256": file_hash,
+        "whitelist_sha256": wl_sha,
+        "watchlist_sha256": wt_sha,
+        "model_version": "v2.2.0 (Fused Multi-Signal Anomaly Engine)",
+        "rf_model_hash": rf_hash,
+        "contamination": contamination,
+        "weights": weights,
+        "detector_thresholds": detector_thresholds,
+        "funnel_numbers": funnel_numbers,
+        "tier_counts": tier_counts,
+    }
+
+    # 3. Build PDF and JSON Dossiers (with caching in session_state)
+    dossier_cache_key = f"{file_hash}_{dossier_meta['analyst_name']}_{contamination}_{len(df)}"
+    if st.session_state.get("_dossier_cache_key") == dossier_cache_key:
+        pdf_bytes = st.session_state["_dossier_pdf_bytes"]
+        json_bytes = st.session_state["_dossier_json_bytes"]
+        pdf_sha256 = st.session_state["_dossier_pdf_sha256"]
+    else:
+        with st.spinner("Generating court-ready multi-page PDF & JSON evidence dossiers..."):
+            pdf_bytes = dossier.build_pdf(df, dossier_meta)
+            json_str = dossier.build_json(df, dossier_meta)
+            json_bytes = json_str.encode("utf-8")
+            pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+
+            st.session_state["_dossier_cache_key"] = dossier_cache_key
+            st.session_state["_dossier_pdf_bytes"] = pdf_bytes
+            st.session_state["_dossier_json_bytes"] = json_bytes
+            st.session_state["_dossier_pdf_sha256"] = pdf_sha256
+
+    # 4. Display PDF Provenance SHA-256
+    st.markdown("<b>🔒 Generated PDF SHA-256 Provenance Hash:</b>", unsafe_allow_html=True)
+    st.code(pdf_sha256, language=None)
+
+    # 5. Download Buttons: PDF, JSON, TXT, and .sha256 Sidecar
+    btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+
+    with btn_col1:
         st.download_button(
-            label="📥 Download Full Results CSV",
-            data=csv_export,
-            file_name="mithya_full_results.csv",
-            mime="text/csv",
+            label="📕 Download Dossier (PDF)",
+            data=pdf_bytes,
+            file_name=f"mithya_forensic_dossier_{case_id}.pdf",
+            mime="application/pdf",
             use_container_width=True,
         )
 
-    with exp_col2:
-        # Court-ready report
-        import platform
-        report_lines = [
-            "=" * 70,
-            "  MITHYA — Crypto Forensic Triage Report",
-            f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"  Engine: IsolationForest (n_estimators=200, contamination={contamination})",
-            "=" * 70,
-            "",
-            "  DATA PROVENANCE & CONFIGURATION",
-            "  -------------------------------",
-            f"  Ingestion Time:   {ingest_time}",
-            f"  Source File Hash: {file_hash} (SHA-256)",
-            f"  Model Version:    v1.4.0 (Graph-Aware Anomaly Detection)",
-            f"  System Config:    {platform.platform()} / Python {platform.python_version()}",
-            "",
-            "  ANALYSIS SUMMARY",
-            "  ----------------",
-            f"  Total Transactions Analysed:  {total_tx:,}",
-            f"  Institutional Transfers Cleared: {whitelisted_count}",
-            f"  ML Anomalies Flagged:        {total_flagged}",
-            f"  CoinJoin Mixers Detected:    {mixer_count}",
-            f"  Peel Chains Detected:        {peel_count}",
-            f"  Fan-Out Dispersals:          {fanout_count}",
-            f"  Fee-Spike Urgency Hops:      {feespike_count}",
-            f"  Max Investigative Priority Index: {max_risk:.1f}%",
-            "",
-            "-" * 70,
-            "  FLAGGED TRANSACTIONS",
-            "-" * 70,
-            "",
-        ]
-
-        if total_flagged > 0:
-            for _, row in flagged_df.sort_values("risk_score", ascending=False).iterrows():
-                report_lines.append(f"  TXID: {row['txid']}")
-                report_lines.append(f"  Priority: {row['risk_score']:.1f}%  |  Entity: {row.get('entity_id', 'N/A')}")
-                report_lines.append(f"  Source IP: {row['src_ip']}  |  Port: {row['src_port']}")
-                report_lines.append(f"  Amount: {row.get('total_amount_btc', 'N/A')} BTC  |  Fee: {row['fee']}")
-                report_lines.append(f"  Geo: {_display_geo(row.get('geo_country'), 'geo')}  |  ASN: {_display_geo(row.get('asn'), 'asn')}")
-                report_lines.append(f"  {row['explanation']}")
-                report_lines.append("")
-        else:
-            report_lines.append("  No anomalies detected.")
-
-        report_lines.append("=" * 70)
-        report_lines.append("  END OF REPORT")
-        report_lines.append("=" * 70)
-
-        report_text = "\n".join(report_lines)
+    with btn_col2:
         st.download_button(
-            label="📄 Generate Evidence Dossier",
+            label="📋 Download Evidence (JSON)",
+            data=json_bytes,
+            file_name=f"mithya_forensic_dossier_{case_id}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    with btn_col3:
+        st.download_button(
+            label="📄 Download Report (TXT)",
             data=report_text.encode("utf-8"),
-            file_name=f"mithya_forensic_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            file_name=f"mithya_forensic_report_{case_id}.txt",
             mime="text/plain",
             use_container_width=True,
         )
+
+    with btn_col4:
+        sidecar_text = f"{pdf_sha256}  mithya_forensic_dossier_{case_id}.pdf\n"
+        st.download_button(
+            label="🔐 Download .sha256 Sidecar",
+            data=sidecar_text.encode("utf-8"),
+            file_name=f"mithya_forensic_dossier_{case_id}.pdf.sha256",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+    # Full Results CSV
+    st.markdown("<div style='margin-top: 0.5rem;'></div>", unsafe_allow_html=True)
+    csv_export = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Download Full Results CSV",
+        data=csv_export,
+        file_name="mithya_full_results.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1863,6 +2180,21 @@ with tab4:
                     <div>
                         <div style="color: {_dp['muted']}; font-size: 0.68rem; text-transform: uppercase;">Entity</div>
                         <div style="color: {_dp['text']};">{tx_row.get('entity_id', 'N/A')}</div>
+                    </div>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; font-size: 0.82rem; margin-top: 0.8rem;
+                            background: rgba(59,130,246,0.06); border: 1px solid rgba(59,130,246,0.2); border-radius: 0.5rem; padding: 0.6rem 1rem;">
+                    <div>
+                        <div style="color: {_dp['muted']}; font-size: 0.68rem; text-transform: uppercase; font-weight: 600;">📡 Telemetry Observations</div>
+                        <div style="color: #60a5fa; font-weight: 700; font-size: 0.95rem;">
+                            {int(tx_row.get('ip_observation_count', 1))} <span style="font-size:0.75rem; font-weight: normal; color:{_dp['muted']};">observation(s)</span>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="color: {_dp['muted']}; font-size: 0.68rem; text-transform: uppercase; font-weight: 600;">⏱️ Observation Spread</div>
+                        <div style="color: #60a5fa; font-weight: 700; font-size: 0.95rem;">
+                            {float(tx_row.get('observation_spread_s', 0.0)):.2f}s <span style="font-size:0.75rem; font-weight: normal; color:{_dp['muted']};">propagation window</span>
+                        </div>
                     </div>
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; font-size: 0.82rem; margin-top: 0.8rem;

@@ -10,3 +10,4 @@ geoip2
 maxminddb
 requests
 defusedxml
+reportlab

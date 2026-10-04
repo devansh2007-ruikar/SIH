@@ -645,3 +645,74 @@ def test_xml_rejects_billion_laughs_attack():
     finally:
         os.remove(tmp_path)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. MULTI-LAYER CORRELATION (TELEMETRY × BLOCKCHAIN)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_correlate_layers_metrics_and_first_seen():
+    """Verify correlate_layers correctly identifies first_seen_ip, observation count, and spread."""
+    from transaction_adapter import correlate_layers
+
+    net_df = pd.DataFrame([
+        {"timestamp": "2026-07-27 10:00:10", "src_ip": "10.0.0.2", "dst_ip": "1.2.3.4", "src_port": 9050, "dst_port": 8333, "txid": "tx1"},
+        {"timestamp": "2026-07-27 10:00:00", "src_ip": "10.0.0.1", "dst_ip": "1.2.3.4", "src_port": 8333, "dst_port": 8333, "txid": "tx1"},
+        {"timestamp": "2026-07-27 10:00:25", "src_ip": "10.0.0.3", "dst_ip": "1.2.3.4", "src_port": 8333, "dst_port": 8333, "txid": "tx1"},
+        {"timestamp": "2026-07-27 11:00:00", "src_ip": "10.0.0.4", "dst_ip": "1.2.3.4", "src_port": 8333, "dst_port": 8333, "txid": "tx_telemetry_only"},
+    ])
+
+    chain_df = pd.DataFrame([
+        {"txid": "tx1", "timestamp": "2026-07-27 10:00:00", "input_addresses": "bc1qA", "output_addresses": "bc1qB", "input_amounts": "1.0", "output_amounts": "0.99", "fee": 0.01, "script_type": "P2WPKH"},
+        {"txid": "tx_chain_only", "timestamp": "2026-07-27 12:00:00", "input_addresses": "bc1qC", "output_addresses": "bc1qD", "input_amounts": "2.0", "output_amounts": "1.99", "fee": 0.01, "script_type": "P2WPKH"},
+    ])
+
+    merged, stats = correlate_layers(net_df, chain_df)
+
+    # Stats validation
+    assert stats["matched"] == 1
+    assert stats["telemetry_only"] == 1
+    assert stats["chain_only"] == 1
+    assert stats["match_rate"] == round(1 / 3, 4)
+
+    # Row per chain txid
+    assert len(merged) == 2
+    row_tx1 = merged[merged["txid"] == "tx1"].iloc[0]
+
+    # Earliest timestamp IP was 10.0.0.1 (at 10:00:00, vs 10:00:10 and 10:00:25)
+    assert row_tx1["src_ip"] == "10.0.0.1"
+    assert row_tx1["ip_observation_count"] == 3
+    assert row_tx1["observation_spread_s"] == 25.0
+
+    row_chain_only = merged[merged["txid"] == "tx_chain_only"].iloc[0]
+    assert row_chain_only["src_ip"] == ""
+    assert row_chain_only["ip_observation_count"] == 0
+    assert row_chain_only["observation_spread_s"] == 0.0
+
+
+def test_split_files_on_disk():
+    """Verify generated sample_data/network_telemetry.csv and blockchain_tx.csv meet spec."""
+    net_path = os.path.join("sample_data", "network_telemetry.csv")
+    chain_path = os.path.join("sample_data", "blockchain_tx.csv")
+
+    assert os.path.isfile(net_path), f"Missing {net_path}"
+    assert os.path.isfile(chain_path), f"Missing {chain_path}"
+
+    net_df = pd.read_csv(net_path)
+    chain_df = pd.read_csv(chain_path)
+
+    expected_net_cols = ["timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "txid"]
+    expected_chain_cols = ["txid", "timestamp", "input_addresses", "output_addresses", "input_amounts", "output_amounts", "fee", "script_type"]
+
+    assert list(net_df.columns) == expected_net_cols
+    assert list(chain_df.columns) == expected_chain_cols
+
+    # Test correlation on generated sample data
+    from transaction_adapter import correlate_layers
+    merged, stats = correlate_layers(net_df, chain_df)
+    assert stats["matched"] == len(chain_df)
+    assert stats["match_rate"] == 1.0
+    assert "ip_observation_count" in merged.columns
+    assert "observation_spread_s" in merged.columns
+    # Check extra observations exist
+    assert (merged["ip_observation_count"] > 1).sum() > 0
+

@@ -940,6 +940,18 @@ def engineer_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     features["fund_diminishment_ratio"] = chain_data["fund_diminishment_ratio"]
     df["peel_chain_id"] = chain_data["chain_id"]
 
+    # --- Multi-Layer Correlation Features ---
+    # These columns are populated when the user uploads separate
+    # network-telemetry + blockchain files and correlate_layers() merges them.
+    # Defaults: 1 observation, 0.0s spread for single-layer datasets.
+    if "ip_observation_count" not in df.columns:
+        df["ip_observation_count"] = 1
+    features["ip_observation_count"] = df["ip_observation_count"].fillna(1).astype(float)
+
+    if "observation_spread_s" not in df.columns:
+        df["observation_spread_s"] = 0.0
+    features["observation_spread_s"] = df["observation_spread_s"].fillna(0.0).astype(float)
+
     _log(f"[*] Engineered {features.shape[1]} features: {list(features.columns)}")
     return features, df
 
